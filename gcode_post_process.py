@@ -4,6 +4,7 @@ from collections import OrderedDict
 import logging
 import argparse
 import sys
+import itertools
 import numpy as np
 
 class Operation():
@@ -21,14 +22,15 @@ class Operation():
         ("K", float),
         ("F", float)
     ])
-    __slots__ = tuple(parse_map.keys())
+    __slots__ = tuple(itertools.chain(parse_map.keys(), ("line", "source")))
     
-    def __init__(self):
-        pass
+    def __init__(self, line=None, source=None):
+        self.line = line
+        self.source = source
         
     @classmethod
-    def parse(cls, line):
-        result = cls()
+    def parse(cls, line, source):
+        result = cls(line, source)
         for token in line.split():
             try:
                 key = token[0]
@@ -46,8 +48,11 @@ class Operation():
         tokens = [ f"{attr}{getattr(self, attr)}" for attr in self.parse_map.keys() if hasattr(self, attr) ]
         return " ".join(tokens)
         
+    def __repr__(self):
+        return f"{self.source}: {str(self)}"
+        
 
-def optimize_step_over(lines, radius):
+def optimize_step_over(lines, radius, offset=0):
     '''
     Removes step-overs to identical Z-hieght within the specified radius of travel.
     '''
@@ -61,8 +66,9 @@ def optimize_step_over(lines, radius):
         if not line.startswith("G"):
             yield line
             continue
-            
-        op = Operation.parse(line)
+        
+        line_number = offset + index    
+        op = Operation.parse(line, line_number)
         if op.G == 0:
             pending.append(line)
         elif op.G > 0 and op.G <= 4:
@@ -70,7 +76,7 @@ def optimize_step_over(lines, radius):
                 if last_op is None or (op.distance_squared(last_op) > threshold and last_op.Z == op.Z):
                     yield from pending
                 else:
-                    logging.debug("Optimized out step-over in lines %d-%d: '%s'", index-len(pending), index, pending)
+                    logging.debug("Optimized out step-over in lines %d-%d: '%s'", line_number - len(pending), line_number, pending)
                     count += 1
                     
                 pending.clear()
@@ -181,7 +187,8 @@ def split_z_layers(gcode: GcodeFile, z_thresh=0):
         if line.strip().startswith("("):
             continue
         
-        op = Operation.parse(line)
+        line_number = index + len(gcode.preamble)
+        op = Operation.parse(line, line_number)
         if hasattr(op, "Z"):
             if op.Z >= z_thresh:
                 pass
@@ -191,10 +198,10 @@ def split_z_layers(gcode: GcodeFile, z_thresh=0):
                 logging.debug("Layer created from lines %d-%d at z-height %f.", len(gcode.preamble) + start, len(gcode.preamble) + index, current_z)
                 layer = []
                 if len(layers):
-                    move_to_start = Operation.parse(gcode.lines[start])
+                    move_to_start = Operation.parse(gcode.lines[start], start + len(gcode.preamble))
                     del move_to_start.Z
                     layer.append(safe_travel_height)
-                    layer.append(f"{move_to_start}\n")
+                    layer.append(f"{str(move_to_start)}\n")
                 layer.extend(gcode.lines[start:index])
                 
                 layers.append(GcodeFile(gcode.preamble, layer, gcode.postamble))
@@ -207,10 +214,10 @@ def split_z_layers(gcode: GcodeFile, z_thresh=0):
         logging.debug("Layer created from lines %d-%d at z-height %f.", len(gcode.preamble) + start, len(gcode.preamble) + len(gcode.lines), current_z)
         layer = []
         if len(layers):
-            move_to_start = Operation.parse(gcode.lines[start])
+            move_to_start = Operation.parse(gcode.lines[start], start + len(gcode.preamble))
             del move_to_start.Z
             layer.append(safe_travel_height)
-            layer.append(f"{move_to_start}\n")
+            layer.append(f"{str(move_to_start)}\n")
         layer.extend(gcode.lines[start:])
         
         layers.append(GcodeFile(gcode.preamble, layer, gcode.postamble))
@@ -218,31 +225,16 @@ def split_z_layers(gcode: GcodeFile, z_thresh=0):
     logging.info("Identifed %d layers", len(layers))
     return layers
             
-def align_floor(value, unit):
-    count = int(value / unit)
-    result = count * unit
-    if result == value:
-        return result
-    if result > 0:
-        return result
-    else:
-        return result - unit
-
-def align_ceil(value, unit):
-    count = int(value / unit)
-    result = count * unit
-    if result == value:
-        return result
-    if result < 0:
-        return result
-    else:
-        return result + unit
         
-def walk_arc(begin, end, center, step):
+def walk_arc(begin, end, center, step, reverse=False):
+    '''
+    Walks an arc from beginning to end with at most step-length intervals.
+    Always walks CCW.
+    '''
     p0 = begin - center
     p1 = end - center
-    r2 = np.dot(p0, p0)
-    r2_check = np.dot(p1, p1)
+    r2 = np.dot(p0[:2], p0[:2])
+    r2_check = np.dot(p1[:2], p1[:2])
     
     r = np.sqrt(r2)
     r_check = np.sqrt(r2_check)
@@ -253,19 +245,27 @@ def walk_arc(begin, end, center, step):
     a0 = np.arctan2(p0[1], p0[0])
     a1 = np.arctan2(p1[1], p1[0])
     
-    distance = a1 - a0
+    angular_distance = a1 - a0
         
-    if distance < 0:
-        distance += 2 * np.pi
+    if angular_distance < 0:
+        angular_distance += 2 * np.pi
         
-    samples = int(np.ceil(r * distance / step))
+    samples = int(np.ceil(r * angular_distance / step))
     
-    for offset in np.linspace(0, distance, samples):
+    if reverse:
+        steps = zip(np.linspace(angular_distance, 0, samples), np.linspace(p1[2], p0[2], samples))
+    else:
+        steps = zip(np.linspace(0, angular_distance, samples), np.linspace(p0[2], p1[2], samples))
+    
+    for offset, z in steps:
         angle = a0 + offset
-        yield (angle, r)
+        yield np.array((center[0] + np.cos(angle) * r, center[1] + np.sin(angle) *  r, z))
         
         
 def walk_line(begin, end, step):
+    '''
+    Walks a line from beginning to end with at most step-length intervals.
+    '''
     pointer = end - begin
     length = np.linalg.norm(pointer)
     
@@ -273,9 +273,56 @@ def walk_line(begin, end, step):
     
     increment = pointer / samples
     
+    current = begin.copy()
+    
     for ignored in range(0, samples + 1):
-        yield begin
-        begin += increment
+        yield current
+        current += increment
+        
+class Path():
+    '''
+    Captures the path taken by an operation, making implicit state explicit.
+    
+    Steps progress linearly from beginning to end, so that the path may be
+    shortened or split in the inituitive way.
+    '''
+    __slots__: ("op", "begin", "end", "step", "keep")
+    
+    def __init__(self, op, begin, end, step, keep=False):
+        self.begin = begin
+        self.end = end
+        self.op = op
+        self.step = step
+        self.keep = keep
+        
+    def arc_center(self):
+        '''
+        Applies only for G2 and G3 codes.
+        '''
+        return self.begin + np.array((self.op.I, self.op.J, self.op.K))
+        
+        
+    def walk(self):
+        '''
+        Uniform interface for generating points along the path.
+        '''
+        if self.op.G == 0 or self.op.G == 1:
+            # Straight line, though G0 isn't suppose to modify material.
+            yield from walk_line(self.begin, self.end, self.step)
+        
+        elif self.op.G == 2:
+            # Clockwise arc, flip begin, end
+            yield from walk_arc(self.end, self.begin, self.arc_center(), self.step, reverse=True)
+                
+        elif self.op.G == 3:
+            # Counter-clockwise arc
+            yield from walk_arc(self.begin, self.end, self.arc_center(), self.step)
+            
+        else:
+            raise NotImplementedError("Path for '%s' is not implemented!", op)
+            
+    def is_plunge(self):
+        return np.linalg.norm(self.begin[:2] - self.end[:2]) < self.step
      
 
 class RoughingFilter():
@@ -286,72 +333,39 @@ class RoughingFilter():
     
     def __init__(self, gcode, surface_height, endmill_size, voxel_size, max_step):
         self.gcode = gcode
-        self.ops = [Operation.parse(line) for line in gcode.lines if not line.startswith("(")]
         self.surface_height = surface_height
         self.endmill_size = endmill_size
         self.voxel_size = voxel_size
         self.voxel_scale = 1.0/voxel_size
         self.max_step = max_step
+        self.safe_z = surface_height
+        self.z_values = set() 
         
-    def find_bounding_box(self):
-        min_bound = np.array((np.inf, np.inf, np.inf))
-        max_bound = -min_bound
-        
+    def parse_paths(self):
+        '''
+        Process operations to extract implicit prior state for each operation.
+        This makes it possible to reason about each operation independently.
+        '''
         last_x = None
         last_y = None
         last_z = None
         
-        offsets = (-self.endmill_size, self.endmill_size)
+        ops = [Operation.parse(line, index + len(self.gcode.preamble)) for index, line in enumerate(self.gcode.lines) if not line.startswith("(")]
         
-        for op in self.ops:
+        self.paths = []
+        
+        for op in ops:
             x = op.X if hasattr(op, "X") else last_x
             y = op.Y if hasattr(op, "Y") else last_y
             z = op.Z if hasattr(op, "Z") else last_z
             
-            if x is None or y is None or z is None:
-                logging.debug("Ignoring op '%s': Unknown starting position.", op)
-                
-            elif z > self.surface_height:
-                logging.debug("Ignoring op '%s': Endmill above material.", op)
-        
-            elif op.G == 0 or op.G == 1:
-                for x_offset in offsets:
-                    for y_offset in offsets:
-                        point = np.array((x + x_offset, y + y_offset, z))
-                        length = np.linalg.norm(point)
-                        min_bound = np.minimum(min_bound, point)
-                        max_bound = np.maximum(max_bound, point)
-            
-            elif op.G == 2:
-                begin = np.array((last_x, last_y))
-                end = np.array((x, y))
-                center = begin + np.array((op.I, op.J))
-                for angle, radius in walk_arc(end, begin, center, self.voxel_size):
-                    radius += self.endmill_size
-                    point = center + np.array((np.cos(angle) * radius, np.sin(angle) * radius))
-                    point = np.append(point, z)
-                    length = np.linalg.norm(point)
-                    if length > 25.4*12*4:
-                        raise ValueError(f"too long {length}")
-                    min_bound = np.minimum(min_bound, point)
-                    max_bound = np.maximum(max_bound, point)
-                    
-            elif op.G == 3:
-                begin = np.array((last_x, last_y))
-                end = np.array((x, y))
-                center = begin + np.array((op.I, op.J))
-                for angle, radius in walk_arc(begin, end, center, self.voxel_size):
-                    radius += self.endmill_size
-                    point = center + np.array((np.cos(angle) * radius, np.sin(angle) * radius))
-                    point = np.append(point, z)
-                    length = np.linalg.norm(point)
-                    if length > 25.4*12*4:
-                        raise ValueError(f"too long {length}")
-                    min_bound = np.minimum(min_bound, point)
-                    max_bound = np.maximum(max_bound, point)
-                
+            if last_x is None or last_y is None or last_z is None:
+                logging.warning("No path for op '%s' at line %d: Unknown prior position.", op, op.source)
+                if last_z:
+                    self.safe_z = max(last_z, self.safe_z)
             else:
-                logging.warning("Ignoring op '%s': Not implemented!", op)
+                path = Path(op, np.array((last_x, last_y, last_z)), np.array((x, y, z)), self.voxel_size)
+                self.paths.append(path)
                     
             if hasattr(op, "X"):
                 last_x = op.X
@@ -359,11 +373,62 @@ class RoughingFilter():
                 last_y = op.Y
             if hasattr(op, "Z"):
                 last_z = op.Z
+                self.z_values.add(op.Z)
+                
+        logging.info("Parsed %d paths from %d gcode operations (%d lines)", len(self.paths), len(ops), len(self.gcode.lines))
+        logging.debug("Gcode z-values: %s", self.z_values)
+        
+    def find_bounding_box(self):
+        '''
+        Find the bounding box of all operations that interact with the material
+        ignoring step overs/air travel.
+        '''
+        min_bound = np.array((np.inf, np.inf, np.inf))
+        max_bound = -min_bound
+        
+        offsets = [
+            np.array((self.endmill_size, self.endmill_size, 0.0)),
+            np.array((self.endmill_size, -self.endmill_size, 0.0)),
+            np.array((-self.endmill_size, self.endmill_size, 0.0)),
+            np.array((-self.endmill_size, -self.endmill_size, 0.0))
+        ]
+        
+        for index, path in enumerate(self.paths):
+            if min(path.begin[2], path.end[2]) > self.surface_height:
+                logging.debug("Bounding: Ignoring path (%d/%d) '%s': Endmill above material.", index + 1, len(self.paths), path.op)
+                continue
+                
+            if path.is_plunge() and path.begin[2] < path.end[2]:
+                logging.debug("Bounding: Ignoring path (%d/%d) '%s': Endmill retraction.", index + 1, len(self.paths), path.op)
+                continue
+                
+            logging.debug("Bounding: Simulating path (%d/%d) '%s'.", index + 1, len(self.paths), path.op)
+                
+            if path.is_plunge():
+                # Not sure this optimization is worth the code.
+                step = path.begin if path.begin[2] < path.end[2] else path.end
+                for offset in offsets:
+                    point = step + offset
+                    min_bound = np.minimum(min_bound, point)
+                    max_bound = np.maximum(max_bound, point)
+                continue
+                
+            for step in path.walk():
+                if step[2] > self.surface_height:
+                    continue
+                for offset in offsets:
+                    point = step + offset
+                    min_bound = np.minimum(min_bound, point)
+                    max_bound = np.maximum(max_bound, point)
                 
         logging.info("Cutting area bounds: %s to %s", min_bound, max_bound)
         self.bounds = (min_bound, max_bound)
         
     def make_endmill_mask(self):
+        '''
+        Create a matrix mask representing the endmill in voxel space.
+        Much faster than piecewise interaction with the voxel map.
+        '''
         width = int(np.ceil(self.endmill_size * self.voxel_scale))
         if not(width & 1):
             width += 1
@@ -387,19 +452,19 @@ class RoughingFilter():
         self.endmill_mask = mask
         
     def init_voxel_map(self):
+        '''
+        Create a prestine voxel map at the surface height
+        '''
         volume = self.bounds[1] - self.bounds[0]
         voxel_x = 1 + int(np.ceil(volume[0] * self.voxel_scale))
         voxel_y = 1 + int(np.ceil(volume[1] * self.voxel_scale))
         logging.info("Voxel map size: %dx%d", voxel_x, voxel_y)
         self.voxels = np.full((voxel_x, voxel_y), self.surface_height)
-    
-    def carve_to_depth(self, x, y, z):
-        i = int(np.round((x - self.bounds[0][0]) * self.voxel_scale))
-        j = int(np.round((y - self.bounds[0][1]) * self.voxel_scale))
-        if self.voxels[i, j] < z:
-            self.voxels[i, j] = z
             
     def carve_endmill(self, center):
+        '''
+        Update the voxel map with the endmill at the specified position.
+        '''
         i = int(np.round((center[0] - self.bounds[0][0]) * self.voxel_scale))
         j = int(np.round((center[1] - self.bounds[0][1]) * self.voxel_scale))
         shape = np.shape(self.endmill_mask)
@@ -410,6 +475,10 @@ class RoughingFilter():
             self.endmill_mask * center[2] )
     
     def touch_endmill(self, center):
+        '''
+        Determine if the endmill touches the voxel map at the specified
+        position.
+        '''
         i = int(np.round((center[0] - self.bounds[0][0]) * self.voxel_scale))
         j = int(np.round((center[1] - self.bounds[0][1]) * self.voxel_scale))
         shape = np.shape(self.endmill_mask)
@@ -420,141 +489,59 @@ class RoughingFilter():
             logging.warn("Endmill below voxel height %f at %s!", z, center)
         return z >= center[2]
         
-    def carve_above(self, z_threshold):
-        last_x = None
-        last_y = None
-        last_z = None
-        
-        for index, op in enumerate(self.ops):
-            x = op.X if hasattr(op, "X") else last_x
-            y = op.Y if hasattr(op, "Y") else last_y
-            z = op.Z if hasattr(op, "Z") else last_z
+    def carve_range(self, z_min, z_max):
+        '''
+        Process all paths within the specified z-range.
+        '''
+        for index, path in enumerate(self.paths):
+            if min(path.begin[2], path.end[2]) > z_max:
+                logging.debug("Carve: Ignoring path (%d/%d) '%s': Above current z threshold.", index + 1, len(self.paths), path.op)
+                continue
+                
+            if max(path.begin[2], path.end[2]) < z_min:
+                logging.debug("Carve: Ignoring path (%d/%d) '%s': Below current z threshold.", index + 1, len(self.paths), path.op)
+                continue
+                
+            if path.is_plunge() and path.begin[2] < path.end[2]:
+                logging.debug("Carve: Ignoring path (%d/%d) '%s': Endmill retraction.", index + 1, len(self.paths), path.op)
+                continue
+                
+            logging.debug("Carve: Simulating path (%d/%d) '%s'.", index + 1, len(self.paths), path.op)
             
-            logging.debug("Simulating op (%d/%d): '%s'...", index + 1, len(self.ops), op)
-            
-            if last_x is None or last_y is None or last_z is None:
-                logging.debug("Ignoring op '%s': Unknown starting position.", op)
-                
-            elif min(z, last_z) > self.surface_height:
-                logging.debug("Ignoring op '%s': Endmill above material.", op)
-                
-            elif max(z, last_z) < z_threshold:
-                logging.debug("Ignoring op '%s': Below current z threshold.", op)
-        
-            elif op.G == 0 or op.G == 1:
-                begin = np.array((last_x, last_y, last_z))
-                end = np.array((x, y, z))
-                for point in walk_line(begin, end, self.voxel_size):
-                    self.carve_endmill(point)
-            
-            elif op.G == 2:
-                begin = np.array((last_x, last_y))
-                end = np.array((x, y))
-                center = begin + np.array((op.I, op.J))
-                for angle, radius in walk_arc(end, begin, center, self.voxel_size):
-                    point = center + np.array((np.cos(angle) * radius, np.sin(angle) * radius))
-                    point = np.append(point, z)
-                    self.carve_endmill(point)
-                    
-            elif op.G == 3:
-                begin = np.array((last_x, last_y))
-                end = np.array((x, y))
-                center = begin + np.array((op.I, op.J))
-                for angle, radius in walk_arc(begin, end, center, self.voxel_size):
-                    point = center + np.array((np.cos(angle) * radius, np.sin(angle) * radius))
-                    point = np.append(point, z)
-                    self.carve_endmill(point)
-                
-            else:
-                logging.warning("Ignoring op '%s': Not implemented!", op)
-                    
-            if hasattr(op, "X"):
-                last_x = op.X
-            if hasattr(op, "Y"):
-                last_y = op.Y
-            if hasattr(op, "Z"):
-                last_z = op.Z
-                
+            for point in path.walk():
+                if point[2] < z_min or point[2] > z_max:
+                    continue
+                self.carve_endmill(point)
                 
     def optimize_range(self, z_min, z_max):
+        kept = 0
+        for index, path in enumerate(self.paths):
+            if min(path.begin[2], path.end[2]) > z_max:
+                logging.debug("Optimize: Ignoring path (%d/%d) '%s': Above current z threshold.", index + 1, len(self.paths), path.op)
+                continue
                 
-        last_x = None
-        last_y = None
-        last_z = None
-        last_x_op = None
-        last_y_op = None
-        last_z_op = None
-        
-        keepers = set()
-        
-        for index, op in enumerate(self.ops):
-            x = op.X if hasattr(op, "X") else last_x
-            y = op.Y if hasattr(op, "Y") else last_y
-            z = op.Z if hasattr(op, "Z") else last_z
-            
-            logging.debug("Optimizing op (%d/%d): '%s'...", index + 1, len(self.ops), op)
-            
-            touches = False
-            
-            if last_x is None or last_y is None or last_z is None:
-                logging.debug("Ignoring op '%s': Unknown starting position.", op)
+            if max(path.begin[2], path.end[2]) < z_min:
+                logging.debug("Optimize: Ignoring path (%d/%d) '%s': Below current z threshold.", index + 1, len(self.paths), path.op)
+                continue
                 
-            elif min(z, last_z) > z_max:
-                logging.debug("Ignoring op '%s': Above current z threshold.", op)
+            if path.is_plunge() and path.begin[2] < path.end[2]:
+                logging.debug("Optimize: Ignoring path (%d/%d) '%s': Endmill retraction.", index + 1, len(self.paths), path.op)
+                continue
                 
-            elif max(z, last_z) < z_min:
-                logging.debug("Ignoring op '%s': Below current z threshold.", op)
-        
-            elif op.G == 0 or op.G == 1:
-                begin = np.array((last_x, last_y, last_z))
-                end = np.array((x, y, z))
-                for point in walk_line(begin, end, self.voxel_size):
-                    if self.touch_endmill(point):
-                        touches = True
-                        break
-            
-            elif op.G == 2:
-                begin = np.array((last_x, last_y))
-                end = np.array((x, y))
-                center = begin + np.array((op.I, op.J))
-                for angle, radius in walk_arc(end, begin, center, self.voxel_size):
-                    point = center + np.array((np.cos(angle) * radius, np.sin(angle) * radius))
-                    point = np.append(point, z)
-                    if self.touch_endmill(point):
-                        touches = True
-                        break
+            logging.debug("Optimize: Evaluating path (%d/%d) '%s'.", index + 1, len(self.paths), path.op)
+            for point in path.walk():
+                if point[2] < z_min or point[2] > z_max:
+                    continue
+                if self.touch_endmill(point):
+                    # TODO: Optimize path length
+                    path.keep = True
+                    kept += 1
+                    break
                     
-            elif op.G == 3:
-                begin = np.array((last_x, last_y))
-                end = np.array((x, y))
-                center = begin + np.array((op.I, op.J))
-                for angle, radius in walk_arc(begin, end, center, self.voxel_size):
-                    point = center + np.array((np.cos(angle) * radius, np.sin(angle) * radius))
-                    point = np.append(point, z)
-                    if self.touch_endmill(point):
-                        touches = True
-                        break
-                
-            else:
-                logging.warning("Ignoring op '%s': Not implemented!", op)
-                
-            if touches:
-                keepers.add(index)
-                keepers.add(last_x_op)
-                keepers.add(last_y_op)
-                keepers.add(last_z_op)
+            if path.keep and path.op.G == 0:
+                logging.warn("Optimize: G0 path marked as keep!")
                     
-            if hasattr(op, "X"):
-                last_x = op.X
-                last_x_op = index
-            if hasattr(op, "Y"):
-                last_y = op.Y
-                last_y_op = index
-            if hasattr(op, "Z"):
-                last_z = op.Z
-                last_z_op = index
-        
-        logging.info("Keeping %d of %d ops in z-range %f to %f", len(keepers), len(self.ops), z_min, z_max)
+        logging.info("Optimize: Keeping %d of %d ops in z-range %f to %f", kept, len(self.paths), z_min, z_max)
         
                 
 
@@ -578,14 +565,15 @@ if __name__ == "__main__":
     gcode = GcodeFile.load(args.input)
         
     if args.step_over_radius:
-        gcode.lines = [ line for line in optimize_step_over(gcode.lines, args.step_over_radius) ]
+        gcode.lines = [ line for line in optimize_step_over(gcode.lines, args.step_over_radius, len(gcode.preamble)) ]
         
     if args.roughing_step:
         roughing = RoughingFilter(gcode, args.surface_height, args.endmill_size, args.voxel_size, args.roughing_step)
+        roughing.parse_paths()
         roughing.find_bounding_box()
         roughing.init_voxel_map()
         roughing.make_endmill_mask()
-        roughing.carve_above(-20.0)
+        roughing.carve_range(-20.0, 0.0)
         roughing.optimize_range(-20.0, 0.0)
     
     if args.z_layers is not None:
