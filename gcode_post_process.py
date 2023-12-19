@@ -7,6 +7,7 @@ import sys
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
+import datetime
 
 class Operation():
     '''
@@ -274,6 +275,28 @@ def walk_arc(begin, end, center, step, reverse=False):
         yield np.array((center[0] + np.cos(angle) * r, center[1] + np.sin(angle) *  r, z))
         
     yield last.copy()
+    
+def arc_length(begin, end, center):
+    '''
+    Compute the length of the arc
+    '''
+    p0 = begin - center
+    p1 = end - center
+    
+    r = np.linalg.norm(p0[:2])
+    
+    a0 = np.arctan2(p0[1], p0[0])
+    a1 = np.arctan2(p1[1], p1[0])
+    
+    angular_distance = a1 - a0
+    
+    if angular_distance < 0:
+        angular_distance += 2 * np.pi
+    
+    xy = angular_distance * r
+    z = end[2] - begin[2]
+    
+    return np.sqrt(pow(xy, 2) + pow(z, 2))
         
 def walk_line(begin, end, step):
     '''
@@ -296,6 +319,12 @@ def walk_line(begin, end, step):
         current = after
         
     yield end.copy()
+    
+def line_length(begin, end):
+    '''
+    Compute the length of the arc
+    '''
+    return np.linalg.norm(end - begin)
         
 class Path():
     '''
@@ -318,8 +347,7 @@ class Path():
         Applies only for G2 and G3 codes.
         '''
         return self.begin + np.array((self.op.I, self.op.J, self.op.K))
-        
-        
+           
     def walk(self):
         '''
         Uniform interface for generating points along the path.
@@ -338,7 +366,32 @@ class Path():
             
         else:
             raise NotImplementedError("Path for '%s' is not implemented!", op)
+    
+    def length(self):
+        '''
+        Uniform interface for path length.
+        '''
+        if self.op.G == 0 or self.op.G == 1:
+            # Straight line
+            return line_length(self.begin, self.end)
             
+        elif self.op.G == 2:
+            # Clockwise arc, flip begin, end
+            return arc_length(self.end, self.begin, self.arc_center())
+                
+        elif self.op.G == 3:
+            # Counter-clockwise arc
+            return arc_length(self.begin, self.end, self.arc_center())
+            
+        else:
+            raise NotImplementedError("Path for '%s' is not implemented!", op)
+            
+    def duration(self):
+        '''
+        Time to traverse the path
+        '''
+        return datetime.timedelta(minutes=self.length()/self.op.F)
+    
     def is_plunge(self):
         '''
         Check if the path is Z-only
@@ -369,35 +422,35 @@ class Path():
         assert((last == self.end).all())
         
     @classmethod  
-    def between(cls, a, b, g=0):
+    def between(cls, a, b, feed, g=0):
         '''
         Create a linear path bridging two paths.
         '''
-        # TODO: Feed rate
         op = Operation()
         op.G = g
+        op.F = feed
         return cls(op, a.end, b.begin, min(a.step, b.step))
         
     @classmethod  
-    def z_exit(cls, path, z, g=0):
+    def z_exit(cls, path, z, feed, g=0):
         '''
         Create a path lifting out of the specified path.
         '''
-        # TODO: Feed rate
         op = Operation()
         op.G = g
+        op.F = feed
         result = cls(op, path.end, path.end, path.step)
         result.end[2] = z
         return result
         
     @classmethod  
-    def z_enter(cls, path, z, g=1):
+    def z_enter(cls, path, z, feed, g=1):
         '''
         Create a path loweriung into the specified path.
         '''
-        # TODO: Feed rate
         op = Operation()
         op.G = g
+        op.F = feed
         result = cls(op, path.begin, path.begin, path.step)
         result.begin[2] = z
         return result
@@ -505,7 +558,7 @@ class VoxelModel():
         z = np.amax(self.voxels[ i - mid : i + mid + 1, j - mid : j + mid + 1 ] + self.endmill_mask_get)
         return z > center[2]
 
-class RoughingFilter():
+class Simulator():
     '''
     Removes redundand z passes assuming the cutting head can handle up to X depth. Implemented
     via multi-pass voxel model
@@ -521,6 +574,8 @@ class RoughingFilter():
         self.safe_z = surface_height
         self.z_values = set() 
         self.debug = debug
+        self.z_feeds = set()
+        self.xy_feeds = set()
         
     def parse_paths(self):
         '''
@@ -534,6 +589,7 @@ class RoughingFilter():
         ops = [Operation.parse(line, index + len(self.gcode.preamble)) for index, line in enumerate(self.gcode.lines) if not line.startswith("(")]
         
         self.paths = []
+        self.duration = datetime.timedelta()
         
         for op in ops:
             x = op.X if hasattr(op, "X") else last_x
@@ -547,6 +603,14 @@ class RoughingFilter():
             else:
                 path = Path(op, np.array((last_x, last_y, last_z)), np.array((x, y, z)), self.voxel_size)
                 self.paths.append(path)
+                
+                if hasattr(path.op, "F"):
+                    self.duration += path.duration()
+                    
+                    if path.is_plunge():
+                        self.z_feeds.add(op.F)
+                    else:
+                        self.xy_feeds.add(op.F)
                     
             if hasattr(op, "X"):
                 last_x = op.X
@@ -561,8 +625,10 @@ class RoughingFilter():
             if np.linalg.norm(a.end - b.begin) > self.voxel_size:
                 raise RuntimeError(f"Path parsing error: end/begin mismatch in sequence {a.end} != {b.begin}!")
                 
-        logging.info("Parsed %d paths from %d gcode operations (%d lines)", len(self.paths), len(ops), len(self.gcode.lines))
-        logging.debug("Gcode z-values: %s", self.z_values)
+        logging.info("Parsed %d paths from %d gcode operations (%d lines), %s estimated job time.", len(self.paths), len(ops), len(self.gcode.lines), self.duration)
+        logging.debug("Gcode z-values: %s", sorted(self.z_values))
+        logging.debug("Gcode z-feeds: %s", sorted(self.z_feeds))
+        logging.debug("Gcode xy-feeds: %s", sorted(self.xy_feeds))
         
         if self.debug:
             for index, path in enumerate(self.paths):
@@ -728,12 +794,13 @@ class RoughingFilter():
                 fig.colorbar(pcm, extend='max')
                 plt.show()    
             
-    def to_gcode(self, step_over_radius = None):
+    def to_gcode(self):
         check_model = VoxelModel(self.bounds, self.endmill_size, self.voxel_size)
         paths = []
         
-        if step_over_radius is None:
-            step_over_radius = self.endmill_size * 2
+        retract_feed = min(self.z_feeds)
+        extend_feed = min(self.z_feeds)
+        travel_feed = max(self.xy_feeds)
         
         for index, path in enumerate(self.paths):
             if not path.keep:
@@ -743,18 +810,18 @@ class RoughingFilter():
             # Try to step over or direct travel before step-over
             if len(paths):
                 xy_distance = np.linalg.norm(paths[-1].end[:2] - path.begin[:2])
-                if xy_distance <= step_over_radius:
+                if xy_distance < self.voxel_size:
                     if paths[-1].end[2] == path.begin[2]:
                         # Step-over optimization
                         logging.debug("GCode: Processing path (%d/%d) '%s': Direct continuation, same z.", index + 1, len(self.paths), path.op)
                     else:
                         logging.debug("GCode: Processing path (%d/%d) '%s': Direct continuation, new z.", index + 1, len(self.paths), path.op)
-                        paths.append(Path.between(paths[-1], path))
+                        paths.append(Path.between(paths[-1], path, feed=extend_feed))
                 else:
                     travel_height = max(paths[-1].end[2], path.begin[2])
                     
                     # try direct travel
-                    travel = path.between(paths[-1], path, g=0)
+                    travel = path.between(paths[-1], path, feed=travel_feed, g=0)
                     travel.begin[2] = travel_height
                     travel.end[2] = travel_height
                     
@@ -767,32 +834,38 @@ class RoughingFilter():
                     logging.debug("GCode: Processing path (%d/%d) '%s': Travel at height %f.", index + 1, len(self.paths), path.op, travel.begin[2])
                         
                     if travel.begin[2] != paths[-1].end[2]:
-                        paths.append(Path.between(paths[-1], travel, g=0))
+                        paths.append(Path.between(paths[-1], travel, feed=retract_feed, g=0))
+                        
                     paths.append(travel)
                     
                     if travel.end[2] != path.begin[2]:
-                        paths.append(Path.between(travel, path, g=1))
+                        paths.append(Path.between(travel, path, feed=extend_feed, g=1))
                     
 
             else:
                 logging.debug("GCode: Processing path (%d/%d) '%s': Initial path.", index + 1, len(self.paths), path.op)
-                paths.append(Path.z_enter(path, self.safe_z))
+                paths.append(Path.z_enter(path, self.safe_z, feed=extend_feed, g=1))
                 
             paths.append(path)
         
         # incrementally carve for travel checks.
         #
+        duration = datetime.timedelta()
         bounds_min = self.bounds[0]
         bounds_max = self.bounds[1]
         bounds_max[2] = max(self.z_values)
         for index, path in enumerate(paths):
+            duration += path.duration()
             path.sync_op()
             logging.debug("GCode: Verifying path (%d/%d) '%s'.", index + 1, len(paths), path.op)
             for point in path.walk():
-                if (point < bounds_min).any() or (point > bounds_max).any():
+                if self.debug and ((point < bounds_min).any() or (point > bounds_max).any()):
                     raise RuntimeError(f"Point {point} outside of bounding box {bounds_min} to {bounds_max}!")
                 check_model.carve_endmill(point)
                 
+        max_delta = np.amax(np.abs(self.model.voxels - check_model.voxels))
+        if max_delta:
+            logging.critical("WARNING: Optimized gcode departs from model by up to %f!!!", max_delta)
             
         if self.debug:
             shape = np.shape(self.model.voxels)
@@ -826,11 +899,12 @@ class RoughingFilter():
         # Synchronize ops and add path ops
         ops.extend(map(Path.sync_op, paths))
         
-        logging.info("GCode: Generated %d ops from %d paths", len(ops), len(self.paths))
+        logging.info("GCode: Generated %d ops from %d paths, estimated run time %s (down from %s)", len(ops), len(self.paths), duration, self.duration)
         
         lines = [ f"{op}\n" for op in ops ]
         
         return GcodeFile(self.gcode.preamble, lines, self.gcode.postamble)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("GCode post-processing")
@@ -843,6 +917,7 @@ if __name__ == "__main__":
     parser.add_argument("-e", "--endmill-size", type=float, default=6.35, help="Diameter of endmill")
     parser.add_argument("--surface-height", type=float, default=0.0, help="Height of surface")
     parser.add_argument("-r", "--roughing-step", type=float, help="Max roughing step for combining z layers")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debugging mode")
     
     args = parser.parse_args()
     
@@ -855,9 +930,9 @@ if __name__ == "__main__":
         gcode.lines = [ line for line in optimize_step_over(gcode.lines, args.step_over_radius, len(gcode.preamble)) ]
         
     if args.roughing_step:
-        roughing = RoughingFilter(gcode, args.surface_height, args.endmill_size, args.voxel_size, args.roughing_step)
-        roughing.adaptive_process()
-        gcode = roughing.to_gcode(args.step_over_radius)
+        sim = Simulator(gcode, args.surface_height, args.endmill_size, args.voxel_size, args.roughing_step, debug=args.debug)
+        sim.adaptive_process()
+        gcode = sim.to_gcode()
     
     if args.z_layers is not None:
         if '{index}' not in args.output:
