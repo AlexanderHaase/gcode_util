@@ -8,6 +8,8 @@ import itertools
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
+import functools
+from abc import ABC
 
 class Operation():
     '''
@@ -538,56 +540,61 @@ class Path():
         return result
         
         
+class Tool(ABC):
+    def __init__(self):
+        pass
+    
+class Endmill(Tool):
+
+    def __init__(self, endmill_size, voxel_size):
+        self.voxel_size = voxel_size
+        self.endmill_size = endmill_size
+        
+        voxel_diameter = self.endmill_size / voxel_size
+        voxel_radius = voxel_diameter / 2
+        voxel_r2 = pow(voxel_radius, 2)
+        
+        mask_width = int(np.ceil(voxel_diameter))
+        mask_center = mask_width / 2
+        
+        real_width = mask_width * voxel_size
+        self.offset = np.array((real_width / 2, real_width / 2, 0.0))
+        
+        shape = (mask_width, mask_width)
+        
+        self.mask = np.full(shape, np.inf)
+        
+        mid = mask_width // 2
+        if mask_width & 1:
+            mid += 1
+            
+        for a in range(0, mid):
+            for b in range (a, mid):
+                check = pow(a - mask_center , 2) + pow(b - mask_center, 2)
+                if check > voxel_r2:
+                    continue
+                    
+                self.mask[a, b ] = 0
+                self.mask[mask_width - a - 1, b ] = 0
+                self.mask[a, mask_width - b - 1 ] = 0
+                self.mask[mask_width - a - 1, mask_width - b - 1 ] = 0
+                
+                self.mask[b, a ] = 0
+                self.mask[mask_width - b - 1, a ] = 0
+                self.mask[b, mask_width - a - 1 ] = 0
+                self.mask[mask_width - b - 1, mask_width - a - 1 ] = 0
+                
+                    
+        logging.debug("Endmill mask %f size, %f voxel:\n%s", self.endmill_size, self.voxel_size, self.mask)
+        
 class VoxelModel():
     #TODO: Split out endmill into a 'Tool' interface.
     
-    def __init__(self, bounds, endmill_size, voxel_size):
+    def __init__(self, bounds, voxel_size):
         self.bounds = bounds
-        self.endmill_size = endmill_size
         self.voxel_size = voxel_size
         self.voxel_scale = 1.0/voxel_size
         self.reset()
-        self.make_endmill_mask()
-        
-    def make_endmill_mask(self):
-        '''
-        Create a matrix mask representing the endmill in voxel space.
-        Much faster than piecewise interaction with the voxel map.
-        '''
-        width = int(np.ceil(self.endmill_size * self.voxel_scale))
-        #offset = np.array((width / 2, width / 2, 0.0))
-        if not(width & 1):
-            width += 1
-        set_mask = np.zeros((width, width))
-        get_mask = np.full((width, width), -np.inf)
-        r2 = pow(self.endmill_size * self.voxel_scale / 2, 2)
-        mid = width // 2
-        for a in range(0, mid):
-            for b in range (a, mid):
-                check = pow(a, 2) + pow(b, 2)
-                if check > r2:
-                    continue
-                set_mask[mid + a, mid  + b ] = 1
-                set_mask[mid + a, mid  - b ] = 1
-                set_mask[mid - a, mid  + b ] = 1
-                set_mask[mid - a, mid  - b ] = 1
-                set_mask[mid + b, mid  + a ] = 1
-                set_mask[mid + b, mid  - a ] = 1
-                set_mask[mid - b, mid  + a ] = 1
-                set_mask[mid - b, mid  - a ] = 1
-                
-                get_mask[mid + a, mid  + b ] = 0
-                get_mask[mid + a, mid  - b ] = 0
-                get_mask[mid - a, mid  + b ] = 0
-                get_mask[mid - a, mid  - b ] = 0
-                get_mask[mid + b, mid  + a ] = 0
-                get_mask[mid + b, mid  - a ] = 0
-                get_mask[mid - b, mid  + a ] = 0
-                get_mask[mid - b, mid  - a ] = 0
-                
-        logging.debug("Endmill mask:\n%s", set_mask)
-        self.endmill_mask_set = set_mask
-        self.endmill_mask_get = get_mask
         
     def reset(self):
         '''
@@ -598,47 +605,50 @@ class VoxelModel():
         voxel_y = 1 + int(np.ceil(volume[1] * self.voxel_scale))
         logging.debug("Voxel map size: %dx%d", voxel_x, voxel_y)
         self.voxels = np.full((voxel_x, voxel_y), self.bounds[1][2])
+        
+    def coordinates(self, tool, center):
+        '''
+        translate from real world coordinates to voxel coordinates.
+        '''
+        assert(tool.voxel_size == self.voxel_size)
+        
+        position = center - self.bounds[0] - tool.offset
+        
+        i = int(np.round(position[0] * self.voxel_scale))
+        j = int(np.round(position[1] * self.voxel_scale))
+        shape = np.shape(tool.mask)
+        
+        return i, j, shape
             
-    def carve_endmill(self, center):
+    def carve(self, tool, center):
         '''
         Update the voxel map with the endmill at the specified position.
         '''
-        i = int(np.round((center[0] - self.bounds[0][0]) * self.voxel_scale))
-        j = int(np.round((center[1] - self.bounds[0][1]) * self.voxel_scale))
-        shape = np.shape(self.endmill_mask_set)
-        width = shape[0]
-        mid = width // 2
-        self.voxels[ i - mid : i + mid + 1, j - mid : j + mid + 1 ] = np.minimum(
-            self.voxels[ i - mid : i + mid + 1, j - mid : j + mid + 1 ],
-            self.endmill_mask_set * center[2] )
+        i, j, shape = self.coordinates(tool, center)
+        
+        self.voxels[i : i + shape[0], j : j + shape[1]] = np.minimum(
+            self.voxels[i : i + shape[0], j : j + shape[1]],
+            tool.mask + center[2] )
     
-    def touch_endmill(self, center):
+    def touch(self, tool, center):
         '''
         Determine if the endmill touches the voxel map at the specified
         position.
         '''
-        i = int(np.round((center[0] - self.bounds[0][0]) * self.voxel_scale))
-        j = int(np.round((center[1] - self.bounds[0][1]) * self.voxel_scale))
-        shape = np.shape(self.endmill_mask_get)
-        width = shape[0]
-        mid = width // 2
-        z = np.amax(self.voxels[ i - mid : i + mid + 1, j - mid : j + mid + 1 ] + self.endmill_mask_get)
-        if z > center[2]:
-            logging.warn("Endmill below voxel height %f at %s!", z, center)
-        return z >= center[2]
+        i, j, shape = self.coordinates(tool, center)
+        max_z = np.amax(self.voxels[i : i + shape[0], j : j + shape[1]] - tool.mask)
+        if max_z > center[2]:
+            logging.warning("Tool below voxel height %f at %s!", z, center)
+        return max_z >= center[2]
         
-    def crash_endmill(self, center):
+    def crash(self, tool, center):
         '''
         Determine if the endmill crashes into the voxel map at the specified
         position.
         '''
-        i = int(np.round((center[0] - self.bounds[0][0]) * self.voxel_scale))
-        j = int(np.round((center[1] - self.bounds[0][1]) * self.voxel_scale))
-        shape = np.shape(self.endmill_mask_get)
-        width = shape[0]
-        mid = width // 2
-        z = np.amax(self.voxels[ i - mid : i + mid + 1, j - mid : j + mid + 1 ] + self.endmill_mask_get)
-        return z > center[2]
+        i, j, shape = self.coordinates(tool, center)
+        max_z = np.amax(self.voxels[i : i + shape[0], j : j + shape[1]] - tool.mask)
+        return max_z > center[2]
 
 class Simulator():
     '''
@@ -646,10 +656,10 @@ class Simulator():
     via multi-pass voxel model
     '''
     
-    def __init__(self, gcode, surface_height, endmill_size, voxel_size, max_step, debug=True):
+    def __init__(self, gcode, surface_height, tool, voxel_size, max_step, debug=True):
         self.gcode = gcode
         self.surface_height = surface_height
-        self.endmill_size = endmill_size
+        self.tool = tool
         self.voxel_size = voxel_size
         self.voxel_scale = 1.0/voxel_size
         self.max_step = max_step
@@ -726,8 +736,6 @@ class Simulator():
         min_bound = np.array((np.inf, np.inf, np.inf))
         max_bound = -min_bound
         
-        offset = np.array((self.endmill_size, self.endmill_size, 0.0))
-        
         for index, path in enumerate(self.paths):
             if min(path.begin[2], path.end[2]) > self.surface_height:
                 logging.debug("Bounding: Ignoring path (%d/%d) '%s': Endmill above material.", index + 1, len(self.paths), path.op)
@@ -746,8 +754,8 @@ class Simulator():
             if bounds[1][2] > self.surface_height:
                 bounds[1][2] = self.surface_height
             
-            min_bound = np.minimum(bounds[0] - offset, min_bound)
-            max_bound = np.maximum(bounds[1] + offset, max_bound)
+            min_bound = np.minimum(bounds[0] - self.tool.offset, min_bound)
+            max_bound = np.maximum(bounds[1] + self.tool.offset, max_bound)
                 
         logging.info("Cutting area bounds: %s to %s", min_bound, max_bound)
         self.bounds = (min_bound, max_bound)
@@ -756,7 +764,7 @@ class Simulator():
         '''
         Create a prestine voxel map at the surface height
         '''
-        self.model = VoxelModel(self.bounds, self.endmill_size, self.voxel_size)
+        self.model = VoxelModel(self.bounds, self.voxel_size)
         
     def carve_range(self, z_min, z_max):
         '''
@@ -784,7 +792,7 @@ class Simulator():
             for point in path.walk():
                 if point[2] < z_min or point[2] > z_max:
                     continue
-                self.model.carve_endmill(point)
+                self.model.carve(self.tool, point)
                 
     def optimize_range(self, z_min, z_max):
         '''
@@ -815,7 +823,7 @@ class Simulator():
             for point in path.walk():
                 if point[2] < z_min or point[2] > z_max:
                     continue
-                if self.model.touch_endmill(point):
+                if self.model.touch(tool, point):
                     # TODO: Optimize path length
                     kept += 1
                     path.keep = True
@@ -865,7 +873,7 @@ class Simulator():
                 plt.show()    
             
     def to_gcode(self):
-        check_model = VoxelModel(self.bounds, self.endmill_size, self.voxel_size)
+        check_model = VoxelModel(self.bounds, self.voxel_size)
         paths = []
         
         retract_feed = min(self.z_feeds)
@@ -895,7 +903,7 @@ class Simulator():
                     travel.begin[2] = travel_height
                     travel.end[2] = travel_height
                     
-                    crash = any(map(self.model.crash_endmill, travel.walk()))
+                    crash = any(map(functools.partial(self.model.crash, self.tool), travel.walk()))
                     
                     if crash:
                         travel.begin[2] = self.safe_z
@@ -931,7 +939,7 @@ class Simulator():
             for point in path.walk():
                 if self.debug and ((point < bounds_min).any() or (point > bounds_max).any()):
                     raise RuntimeError(f"Point {point} outside of bounding box {bounds_min} to {bounds_max}!")
-                check_model.carve_endmill(point)
+                check_model.carve(self.tool, point)
                 
         max_delta = np.amax(np.abs(self.model.voxels - check_model.voxels))
         if max_delta:
@@ -1000,7 +1008,8 @@ if __name__ == "__main__":
         gcode.lines = [ line for line in optimize_step_over(gcode.lines, args.step_over_radius, len(gcode.preamble)) ]
         
     if args.roughing_step:
-        sim = Simulator(gcode, args.surface_height, args.endmill_size, args.voxel_size, args.roughing_step, debug=args.debug)
+        tool = Endmill(args.endmill_size, args.voxel_size)
+        sim = Simulator(gcode, args.surface_height, tool, args.voxel_size, args.roughing_step, debug=args.debug)
         sim.adaptive_process()
         gcode = sim.to_gcode()
     
