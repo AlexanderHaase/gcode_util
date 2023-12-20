@@ -297,6 +297,47 @@ def arc_length(begin, end, center):
     z = end[2] - begin[2]
     
     return np.sqrt(pow(xy, 2) + pow(z, 2))
+    
+def arc_bounds(begin, end, center):
+    '''
+    Compute the XYZ bounding box of the arc
+    '''
+    p0 = begin - center
+    p1 = end - center
+    
+    r = np.linalg.norm(p0[:2])
+    d = np.linalg.norm(end - begin)
+    
+    a0 = np.arctan2(p0[1], p0[0])
+    a1 = np.arctan2(p1[1], p1[0])
+    
+    angular_distance = a1 - a0
+    
+    if a0 < 0:
+        a0 += 2 * np.pi
+    
+    if a1 < a0:
+        a1 += 2 * np.pi
+        
+    min_bound, max_bound = line_bounds(begin, end)
+    
+    targets = ((0, r, 0), (np.pi / 2, 0, r), (np.pi, -r, 0), (np.pi * 3 / 2, 0, -r))
+    for angle, x, y in targets:
+        if angle < a0:
+            angle += 2 * np.pi
+    
+        if angle <= a1:
+            point = np.array((center[0] + x, center[1] + y, begin[2]))
+            min_bound = np.minimum(point, min_bound)
+            max_bound = np.maximum(point, max_bound)
+    
+    
+    # TODO: np.arctan2 is only so precise :/
+    #
+    tolerance = min(r, d) * 0.0001
+    margin = np.array((tolerance, tolerance, tolerance))
+    
+    return (min_bound - margin, max_bound + margin)
         
 def walk_line(begin, end, step):
     '''
@@ -325,6 +366,13 @@ def line_length(begin, end):
     Compute the length of the arc
     '''
     return np.linalg.norm(end - begin)
+    
+    
+def line_bounds(begin, end):
+    '''
+    Compute the XYZ bounding box of the line
+    '''
+    return (np.minimum(begin, end), np.maximum(begin, end))
         
 class Path():
     '''
@@ -386,6 +434,25 @@ class Path():
         else:
             raise NotImplementedError("Path for '%s' is not implemented!", op)
             
+            
+    def bounds(self):
+        '''
+        Get the min and max XYZ extents
+        '''
+        if self.op.G == 0 or self.op.G == 1:
+            return line_bounds(self.begin, self.end)
+            
+        elif self.op.G == 2:
+            # Clockwise arc, flip begin, end
+            return arc_bounds(self.end, self.begin, self.arc_center())
+                
+        elif self.op.G == 3:
+            # Counter-clockwise arc
+            return arc_bounds(self.begin, self.end, self.arc_center())
+            
+        else:
+            raise NotImplementedError("Path for '%s' is not implemented!", op)
+            
     def duration(self):
         '''
         Time to traverse the path
@@ -412,14 +479,29 @@ class Path():
         Pair-wise validate that the path is no more than step apart and
         visits begin and end exactly.
         '''
+        bounds = self.bounds()
+        length = 0
         last = None
+        
+        for bound in bounds:
+            for dim in bound:
+                assert(dim < 5000)
+        
         for index, point in enumerate(self.walk()):
+            assert((point >= bounds[0]).all())
+            assert((point <= bounds[1]).all())
+        
             if last is None:
                 assert((point == self.begin).all())
             else:
-                assert(np.linalg.norm(point-last) <= self.step)
+                segment = np.linalg.norm(point-last)
+                assert(segment <= self.step)
+                length += segment
+                
             last = point
+            
         assert((last == self.end).all())
+        assert(np.absolute(length - self.length()) < self.step)
         
     @classmethod  
     def between(cls, a, b, feed, g=0):
@@ -644,12 +726,7 @@ class Simulator():
         min_bound = np.array((np.inf, np.inf, np.inf))
         max_bound = -min_bound
         
-        offsets = [
-            np.array((self.endmill_size, self.endmill_size, 0.0)),
-            np.array((self.endmill_size, -self.endmill_size, 0.0)),
-            np.array((-self.endmill_size, self.endmill_size, 0.0)),
-            np.array((-self.endmill_size, -self.endmill_size, 0.0))
-        ]
+        offset = np.array((self.endmill_size, self.endmill_size, 0.0))
         
         for index, path in enumerate(self.paths):
             if min(path.begin[2], path.end[2]) > self.surface_height:
@@ -661,23 +738,16 @@ class Simulator():
                 continue
                 
             logging.debug("Bounding: Simulating path (%d/%d) '%s'.", index + 1, len(self.paths), path.op)
-                
-            if path.is_plunge():
-                # Not sure this optimization is worth the code.
-                step = path.begin if path.begin[2] < path.end[2] else path.end
-                for offset in offsets:
-                    point = step + offset
-                    min_bound = np.minimum(min_bound, point)
-                    max_bound = np.maximum(max_bound, point)
+            
+            bounds = path.bounds()
+            if bounds[0][2] > self.surface_height:
                 continue
                 
-            for step in path.walk():
-                if step[2] > self.surface_height:
-                    continue
-                for offset in offsets:
-                    point = step + offset
-                    min_bound = np.minimum(min_bound, point)
-                    max_bound = np.maximum(max_bound, point)
+            if bounds[1][2] > self.surface_height:
+                bounds[1][2] = self.surface_height
+            
+            min_bound = np.minimum(bounds[0] - offset, min_bound)
+            max_bound = np.maximum(bounds[1] + offset, max_bound)
                 
         logging.info("Cutting area bounds: %s to %s", min_bound, max_bound)
         self.bounds = (min_bound, max_bound)
