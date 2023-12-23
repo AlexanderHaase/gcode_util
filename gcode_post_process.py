@@ -555,7 +555,7 @@ class Endmill(Tool):
         voxel_r2 = pow(voxel_radius, 2)
         
         mask_width = int(np.ceil(voxel_diameter))
-        mask_center = mask_width / 2
+        mask_center = mask_width / 2 - 0.5 # offset to voxel center
         
         real_width = mask_width * voxel_size
         self.offset = np.array((real_width / 2, real_width / 2, 0.0))
@@ -563,32 +563,20 @@ class Endmill(Tool):
         shape = (mask_width, mask_width)
         
         self.mask = np.full(shape, np.inf)
-        
-        mid = mask_width // 2
-        if mask_width & 1:
-            mid += 1
             
-        for a in range(0, mid):
-            for b in range (a, mid):
-                check = pow(a - mask_center , 2) + pow(b - mask_center, 2)
-                if check > voxel_r2:
+        for a in range(0, mask_width):
+            a2 = pow(a - mask_center, 2)
+            for b in range (a, mask_width):
+                b2 = pow(b - mask_center, 2)
+                if (a2 + b2) > voxel_r2:
                     continue
                     
-                self.mask[a, b ] = 0
-                self.mask[mask_width - a - 1, b ] = 0
-                self.mask[a, mask_width - b - 1 ] = 0
-                self.mask[mask_width - a - 1, mask_width - b - 1 ] = 0
+                self.mask[a, b] = 0
+                self.mask[b, a] = 0
                 
-                self.mask[b, a ] = 0
-                self.mask[mask_width - b - 1, a ] = 0
-                self.mask[b, mask_width - a - 1 ] = 0
-                self.mask[mask_width - b - 1, mask_width - a - 1 ] = 0
-                
-                    
         logging.debug("Endmill mask %f size, %f voxel:\n%s", self.endmill_size, self.voxel_size, self.mask)
         
 class VoxelModel():
-    #TODO: Split out endmill into a 'Tool' interface.
     
     def __init__(self, bounds, voxel_size):
         self.bounds = bounds
@@ -779,13 +767,15 @@ class Simulator():
                 logging.debug("Carve: Ignoring path (%d/%d) '%s': Below current z threshold.", index + 1, len(self.paths), path.op)
                 continue
                 
-            if path.is_plunge() and path.begin[2] < path.end[2]:
-                logging.debug("Carve: Ignoring path (%d/%d) '%s': Endmill retraction.", index + 1, len(self.paths), path.op)
-                continue
-                
-            if path.is_plunge() and len(self.paths) > (index + 1) and np.linalg.norm(path.end - self.paths[index + 1].begin) <= self.voxel_size:
-                logging.debug("Carve: Ignoring path (%d/%d) '%s': Endmill extension.", index + 1, len(self.paths), path.op)
-                continue
+            if path.is_plunge():
+                if path.begin[2] < path.end[2]:
+                    logging.debug("Carve: Ignoring path (%d/%d) '%s': Tool retraction.", index + 1, len(self.paths), path.op)
+                    continue
+                    
+                # Skip extension if the next path is not a retraction
+                if index + 1 < len(self.paths) and not self.paths[index + 1].is_plunge():
+                    logging.debug("Carve: Ignoring path (%d/%d) '%s': Tool extension.", index + 1, len(self.paths), path.op)
+                    continue
                 
             logging.debug("Carve: Simulating path (%d/%d) '%s'.", index + 1, len(self.paths), path.op)
             
@@ -812,13 +802,15 @@ class Simulator():
                 logging.debug("Optimize: Ignoring path (%d/%d) '%s': Below current z threshold.", index + 1, len(self.paths), path.op)
                 continue
                 
-            if path.is_plunge() and path.begin[2] < path.end[2]:
-                logging.debug("Optimize: Ignoring path (%d/%d) '%s': Endmill retraction.", index + 1, len(self.paths), path.op)
-                continue
-                
-            if path.is_plunge() and len(self.paths) > (index + 1) and np.linalg.norm(path.end - self.paths[index + 1].begin) <= self.voxel_size:
-                logging.debug("Optimize: Ignoring path (%d/%d) '%s': Endmill extension.", index + 1, len(self.paths), path.op)
-                continue
+            if path.is_plunge():
+                if path.begin[2] < path.end[2]:
+                    logging.debug("Optimize: Ignoring path (%d/%d) '%s': Tool retraction.", index + 1, len(self.paths), path.op)
+                    continue
+                    
+                # Skip extension if the next path is not a retraction
+                if index + 1 < len(self.paths) and not self.paths[index + 1].is_plunge():
+                    logging.debug("Optimize: Ignoring path (%d/%d) '%s': Tool extension.", index + 1, len(self.paths), path.op)
+                    continue
                 
             for point in path.walk():
                 if point[2] < z_min or point[2] > z_max:
@@ -840,6 +832,45 @@ class Simulator():
         logging.info("Optimize: Keeping %d of %d ops in z-range %f to %f", kept, len(self.paths), z_min, z_max)
         return kept
         
+        
+    def graph_range(self, ax, z_min, z_max, offset=np.array((0,0)), scale=1):
+        lines = []
+        current = []
+        
+        for index, path in enumerate(self.paths):
+            if max(path.begin[2], path.end[2]) < z_min or min(path.begin[2], path.end[2]) > z_max:
+                logging.debug("Graph: Ignoring path (%d/%d) '%s': Outside z range.", index + 1, len(self.paths), path.op)
+                continue
+                
+            if path.is_plunge() and min(path.begin[2], path.end[2]) < z_min:
+                logging.debug("Graph: Ignoring path (%d/%d) '%s': Plunge below z range.", index + 1, len(self.paths), path.op)
+                continue
+                
+            if len(current) and np.linalg.norm(path.begin[:2] - current[-1]) > self.voxel_size:
+                lines.append(np.array(current))
+                current.clear()
+                logging.debug("Graph: Line change at path (%d/%d) '%s'.", index + 1, len(self.paths), path.op)
+                
+            used = 0
+            total = 0
+            
+            for point in path.walk():
+                total += 1
+                if point[2] >= z_min and point[2] <= z_max:
+                    current.append((point[:2]  + offset) * scale)
+                    used += 1
+                    
+            logging.debug("Graph: Flattened path (%d/%d) '%s': Collected %d/%d points.", index + 1, len(self.paths), path.op, used, total)
+                
+        if len(current):
+            lines.append(np.array(current))
+            
+        logging.info("Graph: Gathered %d lines between %f and %f.", len(lines), z_min, z_max)
+        #size = ax.transData.transform([self.tool.endmill_size,0])[0] - ax.transData.transform([0,0])[0]
+        for line in lines:
+            ax.scatter(line[:, 0], line [:, 1]) #, s=pow(size/2,2)*np.pi)
+        
+            
     def adaptive_process(self):
         '''
         Carve and optimize based on max_step and z_values
@@ -847,6 +878,13 @@ class Simulator():
         self.parse_paths()
         self.find_bounding_box()
         self.init_voxel_map()
+        
+        if self.debug and False:
+            self.graph_range(min(self.z_values), self.surface_height)
+            for z in sorted(filter(lambda z: z <= self.surface_height, self.z_values), reverse=True):
+                if z > self.surface_height:
+                    continue
+                self.graph_range(z, z)
         
         total = 0
         
@@ -947,12 +985,14 @@ class Simulator():
             
         if self.debug:
             shape = np.shape(self.model.voxels)
-            fig, axes = plt.subplots(3, 1)
+            fig, axes = plt.subplots(4, 1, sharex='all', sharey='all')
             X, Y = np.mgrid[0:shape[0], 0:shape[1]]
             
-            for ax, data in zip(axes, (self.model.voxels, check_model.voxels, self.model.voxels - check_model.voxels)):
+            self.graph_range(axes[0], min(self.z_values), self.surface_height, -self.bounds[0][:2], self.voxel_scale)
+            
+            for ax, data in zip(axes[1:], (self.model.voxels, check_model.voxels, self.model.voxels - check_model.voxels)):
                 pcm = ax.pcolormesh(X, Y, data)
-                fig.colorbar(pcm, ax=ax, extend='max')
+                #fig.colorbar(pcm, ax=ax, extend='max')
                 
             plt.show()
                 
@@ -1022,5 +1062,5 @@ if __name__ == "__main__":
             logging.debug("Writing '%s'...", path)
             gcode.save(path)
     else:
-        gcode.save(args.output)
+        gcode.save(args.output.format(index="all"))
         
