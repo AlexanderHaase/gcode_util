@@ -165,6 +165,57 @@ def reorient(origin, x_crossing, points):
     return np.matmul(points - origin, r)
     
     
+class Line():
+    
+    __slots__ = ("offset", "unit", "scale")
+    
+    def __init__(self, offset, unit, scale=None):
+        self.offset = offset
+        if scale is None:
+            self.scale = np.linalg.norm(unit)
+            self.unit = unit / self.scale
+        else:
+            self.scale = scale
+            self.unit = unit
+            
+    @classmethod
+    def fit(cls, points):
+        a = np.vstack((points[:, 0], np.ones(len(points))))
+        a = np.transpose(a)
+        b = points[:, 1:]
+        m, c = np.linalg.lstsq(a, b)[0]
+        # TODO: handle 3d lines
+        return cls(np.array((1, c)), np.array((1, m)))
+        
+    def unmap(self, t):
+        return self.offset + self.unit * self.scale * t
+        
+    def map(self, point, check=1e-16):
+        v = point - self.offset
+        t = np.dot(v, self.unit)
+        if check:
+            assert(abs(np.linalg.norm(v) - abs(t)) < check)
+        return t / self.scale
+        
+    def solve(self, dim, value):
+        return (value - self.offset[dim])/(self.scale * self.unit[dim])
+        
+    def where(self, dim, value):
+        t = self.solve(dim, value)
+        return self.unmap(t)
+        
+    @classmethod
+    def between(cls, a, b, normalize=True):
+        v = b - a
+        scale = np.linalg.norm(v)
+        v /= scale
+        
+        if normalize:
+            scale = 1.0
+            
+        return cls(a, v, scale)
+        
+    
 class Plane():
 
     __slots__ = ("uv", "offset", "normal")
@@ -414,7 +465,7 @@ class Panel():
     '''
     Single panel to be developed
     '''
-    
+
     __slots__ = ('vertices', 'triangles', 'perimeter', 'points', 'quantity')
     
     def __init__(self, vertices, triangles, perimeter, quantity=1, points=None):
@@ -428,7 +479,15 @@ class Panel():
         triangle_strip = sequence(self.vertices, self.triangles)
         points, total_error, max_error = flatten(triangle_strip, tolerance=tolerance)
         logging.info("Total error: %f, max error: %f", total_error, max_error)
-        points = reorient(points[0], points[-1] + points[-2], points)
+        #center = np.mean(points, axis=0)
+        #axis = np.sum(np.absolute(points - center), axis=0)
+        #points = reorient(center, center + axis, points)
+        
+        linear_regression = Line.fit(points)
+        points = reorient(linear_regression.unmap(points[0, 0]), linear_regression.unmap(points[0, 0] + 1), points)
+        
+        
+        #points = reorient(points[0], points[-1] + points[-2], points)
         if mirror:
             points *= np.array((1.0, -1.0))
         if offset:
@@ -458,8 +517,8 @@ class Panel():
             
         # guess an offset
         if offset is None:
-            z_guess = -np.mean(self.vertices[:, 2])
-            x_guess = -abs(np.mean(self.vertices[:, 1]))
+            z_guess = 0 #-np.mean(self.vertices[:, 2])
+            x_guess = 0 #-np.min(self.points[:, 0]) #-abs(np.mean(self.vertices[:, 1]))
             offset = np.array((x_guess, 0, z_guess))
             
         points_2d = sequence(self.points, self.triangles) * scale + offset[:2]
@@ -558,11 +617,6 @@ class Model():
         knee_panel_start = index_of(self.gunwale, self.knee_panel_start)
         cockpit_back = index_of(self.gunwale, self.cockpit_back)
         
-        # Ensure gunwale and front deck match before knee panel, then mirror
-        #
-        knee_line = np.linspace(self.knee_panel_start, self.knee_panel_end, 5 + 4 * samples)
-        self.front_deck_seam = np.concatenate((self.gunwale[:knee_panel_start], knee_line))
-        self.front_deck_seam_mirror = self.front_deck_seam * self.mirror
         
         # Construct hull bottom
         #
@@ -597,6 +651,53 @@ class Model():
         self.side = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 2)
         self.features[Features.SIDE] = self.side
         
+        # Construct coaming base plate
+        #
+        coaming_peak = 10/12
+        coaming_shape = np.array((30, 16, 1.0)) / 12
+        coaming_setback = 1/12
+        coaming_back_center = self.cockpit_back.copy()
+        coaming_back_center[1] = 0
+        coaming_back_center[2] -= coaming_shape[2]
+        
+        coaming_front_center = coaming_back_center.copy()
+        coaming_front_center[0] -= coaming_shape[0]
+        coaming_front_center[2] = coaming_peak
+        
+        coaming_base_line = Line.between(coaming_back_center, coaming_front_center)
+        
+        recess_start_x = coaming_base_line.where(2, self.cockpit_back[2])[0]
+        for v0, v1 in zip(self.gunwale[:-1], self.gunwale[1:]):
+            if v0[0] > recess_start_x or v1[0] < recess_start_x:
+                continue
+                
+            line = Line.between(v0, v1)
+            recess_start = Line.between(v0, v1).where(0, recess_start_x)
+            break
+        
+        # TODO: round recess
+        coaming_base_back = coaming_base_line.unmap(-coaming_setback)
+        coaming_base_back[1] = self.cockpit_back[1]
+        coaming_base_front =  coaming_base_line.unmap(coaming_shape[0] + coaming_setback)
+        coaming_base_front[1] = self.knee_panel_end[1]
+        vertices = np.array((coaming_base_front, coaming_base_back))
+        vertices = np.concatenate((vertices, self.mirror*vertices))
+        indices = [0, 1, 2, 3]
+        perimeter = [0, 1, 3, 2, 0]
+        self.features[Features.COAMING_BASE] = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+         
+        # Ensure gunwale and front deck match before knee panel, then mirror
+        #
+        for knee_gunwell_end, v in enumerate(self.gunwale):
+            if v[0] > recess_start[0]:
+                break
+        knee_points = knee_gunwell_end - knee_panel_start + 2
+        knee_line = np.linspace(self.knee_panel_start, coaming_base_front, knee_points)
+        #knee_line = np.linspace(self.knee_panel_start, coaming_base_front, 5 + 4 * samples)
+        #knee_line = np.linspace(self.knee_panel_start, self.knee_panel_end, 5 + 4 * samples)
+        self.front_deck_seam = np.concatenate((self.gunwale[:knee_panel_start], knee_line))
+        self.front_deck_seam_mirror = self.front_deck_seam * self.mirror
+        
         # Construct front deck
         #
         vertices = np.concatenate((self.front_deck_seam, self.front_deck_seam_mirror))
@@ -613,28 +714,19 @@ class Model():
         self.front_deck = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
         self.features[Features.FRONT_DECK] = self.front_deck
         
-        # Construct coaming base plate
-        #
-        base_back_center = self.cockpit_back.copy()
-        
-        vertices = np.array((self.knee_panel_end, self.cockpit_back))
-        vertices = np.concatenate((vertices, self.mirror*vertices))
-        indices = [0, 1, 2, 3]
-        perimeter = [0, 1, 3, 2, 0]
-        self.features[Features.COAMING_BASE] = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
-        
         # Construct knee deck inbetween gunwale and front deck seam
         #
-        #vertices = np.concatenate((self.front_deck_seam[knee_panel_start:], self.gunwale[knee_panel_start + 1: cockpit_back + 1]))
-        vertices = np.concatenate((self.gunwale[knee_panel_start: cockpit_back + 1], self.front_deck_seam[knee_panel_start + 1:]))
+        #vertices = np.concatenate((self.gunwale[knee_panel_start: cockpit_back + 1], self.front_deck_seam[knee_panel_start + 1:]))
+        vertices = np.concatenate((self.gunwale[knee_panel_start: knee_gunwell_end + 1], self.front_deck_seam[knee_panel_start + 1:]))
+        vertices[knee_gunwell_end - knee_panel_start] = recess_start
         indices = [0]
-        for index in range(1, cockpit_back - knee_panel_start + 1):
+        for index in range(1, knee_gunwell_end - knee_panel_start + 1):
             indices.append(index)
-            indices.append(cockpit_back - knee_panel_start + index)
+            indices.append(knee_gunwell_end - knee_panel_start + index)
             
-        perimeter = list(range(cockpit_back - knee_panel_start + 1))
+        perimeter = list(range(knee_gunwell_end - knee_panel_start + 1))
         offset = len(perimeter)
-        perimeter.extend(reversed(range(offset, offset + len(self.front_deck_seam) - knee_panel_start - 1)))
+        perimeter.extend(reversed(range(offset, len(vertices))))
         perimeter.append(0)
         
         self.knee_deck = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 2)
