@@ -586,30 +586,6 @@ class Features(enum.Enum):
     COAMING_BASE = enum.auto()
     COAMING_RIM = enum.auto()
 
-def coaming_opening(plane, bounding_box, back_width, front_width, samples):
-    # start super simple
-    vertices = []
-    vertices.append(plane.unmap((0, 0)))
-    vertices.append(plane.unmap((bounding_box[0] * .1, back_width * .5)))
-    vertices.append(plane.unmap((bounding_box[0] * .2, bounding_box[1] *.5)))
-    #vertices.append(plane.unmap((bounding_box[0] * .5, bounding_box[1] * .45)))
-    vertices.append(plane.unmap((bounding_box[0] * .6, front_width * .5)))
-    
-    vertices.append(plane.unmap((bounding_box[0] * .85, front_width * .5)))
-    vertices.append(plane.unmap((bounding_box[0], 0)))
-    vertices = arc_interpolate(vertices, samples)
-    vertices = np.concatenate((vertices, vertices[1:-1] * np.array((1, -1, 1))))
-    triangles = [0]
-    count = len(vertices) // 2
-    for index in range(1, count):
-        triangles.append(index)
-        triangles.append(count + index)
-    triangles.append(count)
-    perimeter = list(range(count + 1))
-    perimeter.extend(reversed(range(count + 1, count * 2)))
-    perimeter.append(0)
-    
-    return Panel(vertices, np.array(triangles, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
     
 def coaming_opening2(plane, bounding_box, samples, split_x):
     # start super simple
@@ -632,18 +608,21 @@ def coaming_opening2(plane, bounding_box, samples, split_x):
         point = offset + scale * (np.sin(angle), np.cos(angle))
         vertices.append(plane.unmap(point))
         
+    vertices.append(plane.unmap((bounding_box[0], 0)))
+    
+    count = len(vertices) - 1
+    
     vertices = np.concatenate((vertices, vertices[:-1] * np.array((1, -1, 1))))
     triangles = []
-    count = len(vertices) // 2
     for index in range(count):
         triangles.append(index)
-        triangles.append(count + index)
+        triangles.append(count + 1 + index)
     triangles.append(count)
     perimeter = list(range(count + 1))
-    perimeter.extend(reversed(range(count + 1, count * 2)))
+    perimeter.extend(reversed(range(count + 1, count * 2 + 1)))
     perimeter.append(0)
     
-    return Panel(vertices, np.array(triangles, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+    return Panel(vertices, np.array(triangles, dtype=np.int32), np.array(perimeter, dtype=np.int32), -1)
     
 class Model():
     ref_gunwale = np.array([
