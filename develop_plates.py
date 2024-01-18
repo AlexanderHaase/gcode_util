@@ -169,6 +169,12 @@ class Line():
     
     __slots__ = ("offset", "unit", "scale")
     
+    @classmethod
+    def axis(cls, total, axis, dtype=np.double):
+        unit = np.zeros(total, dtype=dtype)
+        unit[axis] = 1.0
+        return cls(np.zeros(total, dtype=dtype), unit, 1.0)
+    
     def __init__(self, offset, unit, scale=None):
         self.offset = offset
         if scale is None:
@@ -215,6 +221,20 @@ class Line():
             
         return cls(a, v, scale)
         
+    def nearest(self, other):
+        '''
+        find the pair of points closest to intersection
+        '''
+        # Min distance when the line between the two is perpendicular to both (dot product)
+        # u1*(m1*t1 + c1 - m2*t2 - c2) = 0
+        # u2*(m1*t1 + c1 - m2*t2 - c2) = 0
+        #
+        # u1*(m1*t1 + c1 - c2) / (u1*m2) = t2
+        # u2*(m1*t1 + c1 - c2) / (u2*m2) = t2
+        # u1*(m1*t1 + c1 - c2) / (u1*m2) = u2*(m1*t1 + c1 - c2) / (u2*m2)
+        # u1*(m1*t1 + c1 - c2) * (u2*m2) = u2*(m1*t1 + c1 - c2) * (u1*m2)
+        # (u1*(u2*m2) - u2*(u1*m2)) * (m1*t1 + c1 - c2) = 0
+        
     
 class Plane():
 
@@ -244,7 +264,15 @@ class Plane():
         
     def unmap(self, point):
         return self.offset + np.matmul(point, self.uv)
-    
+        
+    @classmethod
+    def from_lines(cls, u, v, offset=None):
+        uv = np.stack((u.unit, v.unit))
+        normal = np.cross(u.unit, v.unit)
+        if offset is None:
+            offset = u.offset
+        return cls(uv, offset, normal)
+        
     
 
 class Arc():
@@ -440,8 +468,16 @@ def arc_interpolate(vertices, count):
             point_1 = arc_1.unmap(offset_1 + step_1 * segment)
             if arc_0:
                 point_0 = arc_0.unmap(offset_0 + step_0 * segment)
-                point = point_1 + point_0
-                point *= 0.5
+                
+                # Angular weighting
+                k = step_0 / (step_0 + step_1)
+                w1 = segment / segments
+                w0 = 1.0 - w1
+                w0 *= 1.0 - k
+                w1 *= k
+                
+                point = point_1 * w1 + point_0 * w0
+                point /= w0 + w1
             else:
                 point = point_1
             result.append(point)
@@ -548,7 +584,67 @@ class Features(enum.Enum):
     KNEE_DECK = enum.auto()
     BACK_DECK = enum.auto()
     COAMING_BASE = enum.auto()
+    COAMING_RIM = enum.auto()
 
+def coaming_opening(plane, bounding_box, back_width, front_width, samples):
+    # start super simple
+    vertices = []
+    vertices.append(plane.unmap((0, 0)))
+    vertices.append(plane.unmap((bounding_box[0] * .1, back_width * .5)))
+    vertices.append(plane.unmap((bounding_box[0] * .2, bounding_box[1] *.5)))
+    #vertices.append(plane.unmap((bounding_box[0] * .5, bounding_box[1] * .45)))
+    vertices.append(plane.unmap((bounding_box[0] * .6, front_width * .5)))
+    
+    vertices.append(plane.unmap((bounding_box[0] * .85, front_width * .5)))
+    vertices.append(plane.unmap((bounding_box[0], 0)))
+    vertices = arc_interpolate(vertices, samples)
+    vertices = np.concatenate((vertices, vertices[1:-1] * np.array((1, -1, 1))))
+    triangles = [0]
+    count = len(vertices) // 2
+    for index in range(1, count):
+        triangles.append(index)
+        triangles.append(count + index)
+    triangles.append(count)
+    perimeter = list(range(count + 1))
+    perimeter.extend(reversed(range(count + 1, count * 2)))
+    perimeter.append(0)
+    
+    return Panel(vertices, np.array(triangles, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+    
+def coaming_opening2(plane, bounding_box, samples, split_x):
+    # start super simple
+    split = split_x / bounding_box[0]
+    samples = max(40, samples*2)
+    vertices = []
+    scale = bounding_box[:2] * np.array((split, 0.25))
+    offset = np.array((scale[0], bounding_box[1] * 0.25))
+    segment_samples = int(np.ceil(samples * split))
+    for index in range(segment_samples):
+        angle = index * np.pi / (2 * segment_samples)
+        point = offset + scale * (-np.cos(angle), np.sin(angle))
+        vertices.append(plane.unmap(point))
+        
+    scale = bounding_box[:2] * np.array((1.0 - split, 0.5))
+    offset[1] = 0
+    segment_samples = int(np.ceil(samples * (1.0 - split)))
+    for index in range(segment_samples):
+        angle = index * np.pi / (2 * segment_samples)
+        point = offset + scale * (np.sin(angle), np.cos(angle))
+        vertices.append(plane.unmap(point))
+        
+    vertices = np.concatenate((vertices, vertices[:-1] * np.array((1, -1, 1))))
+    triangles = []
+    count = len(vertices) // 2
+    for index in range(count):
+        triangles.append(index)
+        triangles.append(count + index)
+    triangles.append(count)
+    perimeter = list(range(count + 1))
+    perimeter.extend(reversed(range(count + 1, count * 2)))
+    perimeter.append(0)
+    
+    return Panel(vertices, np.array(triangles, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+    
 class Model():
     ref_gunwale = np.array([
         [0.0, 0.0, 0.75],
@@ -654,7 +750,7 @@ class Model():
         # Construct coaming base plate
         #
         coaming_peak = 10/12
-        coaming_shape = np.array((30, 16, 1.0)) / 12
+        coaming_shape = np.array((29, 16, 1.0)) / 12
         coaming_setback = 1/12
         coaming_back_center = self.cockpit_back.copy()
         coaming_back_center[1] = 0
@@ -666,7 +762,10 @@ class Model():
         
         coaming_base_line = Line.between(coaming_back_center, coaming_front_center)
         
-        recess_start_x = coaming_base_line.where(2, self.cockpit_back[2])[0]
+        #self.features[Features.COAMING_RIM] = coaming_opening(Plane.from_lines(coaming_base_line, Line.axis(3, 1)), coaming_shape, 14/12, 9/12, samples)
+        
+        recess_gunwale_crossing = coaming_base_line.solve(2, self.cockpit_back[2])
+        recess_start_x = coaming_base_line.unmap(recess_gunwale_crossing)[0]
         for v0, v1 in zip(self.gunwale[:-1], self.gunwale[1:]):
             if v0[0] > recess_start_x or v1[0] < recess_start_x:
                 continue
@@ -675,15 +774,21 @@ class Model():
             recess_start = Line.between(v0, v1).where(0, recess_start_x)
             break
         
+        self.features[Features.COAMING_RIM] = coaming_opening2(Plane.from_lines(coaming_base_line, Line.axis(3, 1)), coaming_shape, samples, recess_gunwale_crossing)
         # TODO: round recess
         coaming_base_back = coaming_base_line.unmap(-coaming_setback)
-        coaming_base_back[1] = self.cockpit_back[1]
+        coaming_base_back[1] = coaming_shape[1] / 2
         coaming_base_front =  coaming_base_line.unmap(coaming_shape[0] + coaming_setback)
         coaming_base_front[1] = self.knee_panel_end[1]
-        vertices = np.array((coaming_base_front, coaming_base_back))
+        vertices = np.array((coaming_base_front, recess_start, coaming_base_back))
         vertices = np.concatenate((vertices, self.mirror*vertices))
-        indices = [0, 1, 2, 3]
-        perimeter = [0, 1, 3, 2, 0]
+        indices = []
+        count = len(vertices) // 2
+        for index in range(count):
+            indices.append(index)
+            indices.append(count + index)
+        perimeter = list(range(count))
+        perimeter.extend(reversed(range(count, count * 2)))
         self.features[Features.COAMING_BASE] = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
          
         # Ensure gunwale and front deck match before knee panel, then mirror
@@ -750,6 +855,8 @@ class Model():
         
         self.back_deck = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
         self.features[Features.BACK_DECK] = self.back_deck
+        
+    
 
 def set_axes_equal(ax):
     """
