@@ -587,6 +587,7 @@ class Features(enum.Enum):
     COAMING_BASE = enum.auto()
     RECESS = enum.auto()
     FRONT_DECK = enum.auto()
+    COAMING_SPACER = enum.auto()
     COAMING_RIM = enum.auto()
     KNEE_DECK = enum.auto()
     BACK_DECK = enum.auto()
@@ -611,6 +612,67 @@ def coaming_back_curve(plane, bounding_box, samples, offset=(0,0)):
         vertices.append(plane.unmap(point))
         
     return vertices
+    
+def coaming_ring(plane, bounding_box, samples, split_x, diameter, qty=1, offset=(0,0)):
+        """
+        Creates a ring with the backmost inner opening at offset and spanning
+        the bounding box in the x axis of the plane. The outer ring is offset
+        by diameter in each direction. split_x defines the transition between
+        front and back curves (relative to bounding box)
+        """
+        mirror = np.array((1, -1, 1), dtype=np.double)
+        
+        coaming_inner_back_shape = np.array((split_x, bounding_box[1]))
+        coaming_inner_back_offset = np.zeros(2, dtype=np.double) + offset
+        coaming_inner_back_samples = samples # match for triangulation
+        coaming_inner_back = coaming_back_curve(plane, coaming_inner_back_shape, coaming_inner_back_samples, coaming_inner_back_offset)
+        
+        coaming_inner_front_shape = np.array((bounding_box[0] - split_x, bounding_box[1]))
+        coaming_inner_front_offset = np.array((split_x, 0)) + offset
+        coaming_inner_front_samples = 2 * samples # just a guess
+        coaming_inner_front = coaming_front_curve(plane, coaming_inner_front_shape, coaming_inner_front_samples, coaming_inner_front_offset)
+        
+        coaming_inner_peak = plane.unmap((bounding_box[0], 0))
+        
+        coaming_outer_back_shape = np.array((split_x, bounding_box[1])) + (diameter, diameter)
+        coaming_outer_back_offset = np.array((-diameter, 0)) + offset
+        coaming_outer_back_samples = samples # match for triangulation
+        coaming_outer_back = coaming_back_curve(plane, coaming_outer_back_shape, coaming_outer_back_samples, coaming_outer_back_offset)
+        
+        coaming_outer_front_shape = np.array((bounding_box[0] - split_x, bounding_box[1])) + (diameter, diameter)
+        coaming_outer_front_offset = np.array((split_x, 0)) + offset
+        coaming_outer_front_samples = 2 * samples # just a guess
+        coaming_outer_front = coaming_front_curve(plane, coaming_outer_front_shape, coaming_outer_front_samples, coaming_outer_front_offset)
+        
+        coaming_outer_peak = plane.unmap((bounding_box[0] + diameter, 0))
+        
+        internal_vertices = np.concatenate((coaming_inner_back, coaming_inner_front))
+        internal_vertices = np.concatenate((internal_vertices, (coaming_inner_peak,), np.flip(internal_vertices, 0) * mirror))
+        
+        external_vertices = np.concatenate((coaming_outer_back, coaming_outer_front))
+        external_vertices = np.concatenate((external_vertices, (coaming_outer_peak,), np.flip(external_vertices, 0) * mirror))
+        
+        assert(len(internal_vertices) == len(external_vertices))
+        
+        vertices = np.concatenate((external_vertices, internal_vertices))
+        
+        indices = []
+        for index in range(len(external_vertices)):
+            indices.append(index)
+            indices.append(len(external_vertices) + index)
+        
+        # Patch in last triangle
+        indices.append(0)
+        indices.append(len(external_vertices))
+        
+        external_perimeter = list(range(len(external_vertices)))
+        external_perimeter.append(0)
+        
+        internal_perimeter = list(range(len(external_vertices), len(vertices)))
+        internal_perimeter.append(len(external_vertices))
+        perimeters = [ np.array(external_perimeter), np.array(internal_perimeter) ]
+
+        return Panel(vertices, np.array(indices, dtype=np.int32), perimeters, qty)
     
 class Model():
     ref_gunwale = np.array([
@@ -719,6 +781,7 @@ class Model():
         coaming_peak = 10/12
         coaming_shape = np.array((29, 16, 1.0)) / 12
         coaming_setback = 1/12
+        coaming_spacer_width = 0.20/12
         coaming_back_center = self.cockpit_back.copy()
         coaming_back_center[1] = 0
         coaming_back_center[2] -= coaming_shape[2]
@@ -740,7 +803,6 @@ class Model():
             recess_start = Line.between(v0, v1).where(0, recess_start_x)
             break
         
-        #self.features[Features.COAMING_RIM] = coaming_opening2(coaming_base_plane, coaming_shape, samples, recess_gunwale_crossing)
         # Round back for recess
         coaming_base_back_shape = np.array((recess_gunwale_crossing + coaming_setback, recess_start[1] * 2))
         coaming_base_back_offset = np.array((-coaming_setback, 0))
@@ -752,6 +814,7 @@ class Model():
         coaming_cut_back_samples = coaming_base_back_samples # match for triangulation
         coaming_cut_back = coaming_back_curve(coaming_base_plane, coaming_cut_back_shape, coaming_cut_back_samples, coaming_cut_back_offset)
         
+        # TODO thigh braces. 22" from back and 8-9" opening for knees. if we're going to round them, they should be wider! 2-3" deep after rounding
         coaming_cut_front_shape = np.array((coaming_shape[0] - recess_gunwale_crossing, coaming_shape[1]))
         coaming_cut_front_offset = np.array((recess_gunwale_crossing, 0))
         coaming_cut_front_samples = 2 * coaming_cut_back_samples # just a guess
@@ -792,61 +855,16 @@ class Model():
 
         self.features[Features.COAMING_BASE] = Panel(vertices, np.array(indices, dtype=np.int32), perimeters, 1)
         
-        # Construct coaming rim
+        # Construct coaming rim and spacer
         #
         coaming_rim_plane = Plane(coaming_base_plane.uv, coaming_base_plane.offset + coaming_base_plane.normal * -coaming_shape[2], coaming_base_plane.normal)
         
-        coaming_inner_back_shape = np.array((recess_gunwale_crossing, coaming_shape[1]))
-        coaming_inner_back_offset = np.zeros(2, dtype=np.double)
-        coaming_inner_back_samples = coaming_base_back_samples # match for triangulation
-        coaming_inner_back = coaming_back_curve(coaming_rim_plane, coaming_inner_back_shape, coaming_inner_back_samples, coaming_inner_back_offset)
+        self.features[Features.COAMING_RIM] = coaming_ring(coaming_rim_plane, coaming_shape, coaming_base_back_samples, recess_gunwale_crossing, coaming_setback, 2)
         
-        coaming_inner_front_shape = np.array((coaming_shape[0] - recess_gunwale_crossing, coaming_shape[1]))
-        coaming_inner_front_offset = np.array((recess_gunwale_crossing, 0))
-        coaming_inner_front_samples = 2 * coaming_inner_back_samples # just a guess
-        coaming_inner_front = coaming_front_curve(coaming_rim_plane, coaming_inner_front_shape, coaming_inner_front_samples, coaming_inner_front_offset)
         
-        coaming_inner_peak = coaming_rim_plane.unmap((coaming_shape[0], 0))
+        coaming_spacer_plane = Plane(coaming_base_plane.uv, coaming_base_plane.offset + coaming_base_plane.normal * -coaming_shape[2] * 0.5, coaming_base_plane.normal)
         
-        coaming_outer_back_shape = np.array((recess_gunwale_crossing, coaming_shape[1])) + (coaming_setback, coaming_setback)
-        coaming_outer_back_offset = np.array((-coaming_setback, 0))
-        coaming_outer_back_samples = coaming_base_back_samples # match for triangulation
-        coaming_outer_back = coaming_back_curve(coaming_rim_plane, coaming_outer_back_shape, coaming_outer_back_samples, coaming_outer_back_offset)
-        
-        coaming_outer_front_shape = np.array((coaming_shape[0] - recess_gunwale_crossing, coaming_shape[1])) + (coaming_setback, coaming_setback)
-        coaming_outer_front_offset = np.array((recess_gunwale_crossing, 0))
-        coaming_outer_front_samples = 2 * coaming_outer_back_samples # just a guess
-        coaming_outer_front = coaming_front_curve(coaming_rim_plane, coaming_outer_front_shape, coaming_outer_front_samples, coaming_outer_front_offset)
-        
-        coaming_outer_peak = coaming_rim_plane.unmap((coaming_shape[0] + coaming_setback, 0))
-        
-        internal_vertices = np.concatenate((coaming_inner_back, coaming_inner_front))
-        internal_vertices = np.concatenate((internal_vertices, (coaming_inner_peak,), np.flip(internal_vertices, 0) * self.mirror))
-        
-        external_vertices = np.concatenate((coaming_outer_back, coaming_outer_front))
-        external_vertices = np.concatenate((external_vertices, (coaming_outer_peak,), np.flip(external_vertices, 0) * self.mirror))
-        
-        vertices = np.concatenate((external_vertices, internal_vertices))
-        
-        indices = []
-        for index in range(len(external_vertices)):
-            indices.append(index)
-            indices.append(len(external_vertices) + index)
-        
-        # Patch in last triangle
-        indices.append(0)
-        indices.append(len(external_vertices))
-        
-        external_perimeter = list(range(len(external_vertices)))
-        external_perimeter.append(0)
-        
-        internal_perimeter = list(range(len(external_vertices), len(vertices)))
-        internal_perimeter.append(len(external_vertices))
-        perimeters = [ np.array(external_perimeter), np.array(internal_perimeter) ]
-
-        self.features[Features.COAMING_RIM] = Panel(vertices, np.array(indices, dtype=np.int32), perimeters, 1)
-        
-        assert(len(internal_vertices) == len(external_vertices))
+        self.features[Features.COAMING_SPACER] = coaming_ring(coaming_spacer_plane, coaming_shape, coaming_base_back_samples, recess_gunwale_crossing, coaming_spacer_width, 6)
          
         # Ensure gunwale and front deck match before knee panel, then mirror
         #
@@ -897,8 +915,8 @@ class Model():
         back_deck_center_line = Line.between(self.gunwale[cockpit_back] * (1, 0, 1), recess_start * (1, 0, 1))
         back_deck_center_line.offset = back_deck_center_line.where(0, coaming_back_center[0])
         back_deck_scallop_plane = Plane.from_lines(back_deck_center_line, Line.axis(3, 1))
-        back_deck_scallop_shape = coaming_base_back_shape + (coaming_setback, 0)
-        back_deck_scallop_offset = coaming_base_back_offset - (coaming_setback, 0)
+        back_deck_scallop_shape = coaming_base_back_shape + (coaming_setback * 2, 0)
+        back_deck_scallop_offset = coaming_base_back_offset - (coaming_setback * 2, 0)
         back_deck_scallop_samples = len(self.gunwale) - cockpit_back
         back_deck_scallop = coaming_back_curve(back_deck_scallop_plane, back_deck_scallop_shape, back_deck_scallop_samples, back_deck_scallop_offset)
         
