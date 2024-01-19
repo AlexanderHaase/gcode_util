@@ -502,12 +502,12 @@ class Panel():
     Single panel to be developed
     '''
 
-    __slots__ = ('vertices', 'triangles', 'perimeter', 'points', 'quantity')
+    __slots__ = ('vertices', 'triangles', 'perimeters', 'points', 'quantity')
     
-    def __init__(self, vertices, triangles, perimeter, quantity=1, points=None):
+    def __init__(self, vertices, triangles, perimeters, quantity=1, points=None):
         self.vertices = vertices
         self.triangles = triangles
-        self.perimeter = perimeter
+        self.perimeters = perimeters
         self.quantity = quantity
         self.points = points
         
@@ -558,24 +558,28 @@ class Panel():
             offset = np.array((x_guess, 0, z_guess))
             
         points_2d = sequence(self.points, self.triangles) * scale + offset[:2]
-        perim_2d = sequence(self.points, self.perimeter) * scale + offset[:2]
+        perimeters = [sequence(self.points, perimeter) * scale  + offset[:2] for perimeter in self.perimeters]
         if z:
             ax.plot(points_2d[:, 0], points_2d[:, 1], np.full(np.shape(points_2d)[0], offset[2]))
-            ax.plot(perim_2d[:, 0], perim_2d[:, 1], np.full(np.shape(perim_2d)[0], offset[2]))
+            for perimeter in perimeters:
+                ax.plot(perimeter[:, 0], perimeter[:, 1], np.full(np.shape(perimeter)[0], offset[2]))
         else:
             ax.plot(points_2d[:, 0], points_2d[:, 1])
-            ax.plot(perim_2d[:, 0], perim_2d[:, 1])
+            for perimeter in perimeters:
+                ax.plot(perimeter[:, 0], perimeter[:, 1])
         
     
     def plot_vertices(self, ax, z=False, scale=1):
         triangle_strip = sequence(self.vertices, self.triangles) * scale
-        perim_3d = sequence(self.vertices, self.perimeter) * scale
+        perimeters = [sequence(self.vertices, perimeter) * scale for perimeter in self.perimeters]
         if z:
             ax.plot(triangle_strip[:, 0], triangle_strip[:, 1], triangle_strip[:, 2])
-            ax.plot(perim_3d[:, 0], perim_3d[:, 1], perim_3d[:, 2])
+            for perimeter in perimeters:
+                ax.plot(perimeter[:, 0], perimeter[:, 1], perimeter[:, 2])
         else:
             ax.plot(triangle_strip[:, 0], triangle_strip[:, 1])
-            ax.plot(perim_3d[:, 0], perim_3d[:, 1])
+            for perimeter in perimeters:
+                ax.plot(perimeter[:, 0], perimeter[:, 1])
             
 class Features(enum.Enum):
     BOTTOM = enum.auto()
@@ -584,7 +588,7 @@ class Features(enum.Enum):
     KNEE_DECK = enum.auto()
     BACK_DECK = enum.auto()
     COAMING_BASE = enum.auto()
-    COAMING_RIM = enum.auto()
+    #COAMING_RIM = enum.auto()
     RECESS = enum.auto()
 
     
@@ -623,8 +627,18 @@ def coaming_opening2(plane, bounding_box, samples, split_x):
     perimeter.extend(reversed(range(count + 1, count * 2 + 1)))
     perimeter.append(0)
     
-    return Panel(vertices, np.array(triangles, dtype=np.int32), np.array(perimeter, dtype=np.int32), -1)
-    
+    return Panel(vertices, np.array(triangles, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], -1)
+
+def coaming_front_curve(plane, bounding_box, samples, offset=(0,0)):
+    vertices = []
+    scale = bounding_box[:2] * np.array((1.0, 0.5))
+    for index in range(samples):
+        angle = index * np.pi / (2 * samples)
+        point = offset + scale * (np.sin(angle), np.cos(angle))
+        vertices.append(plane.unmap(point))
+        
+    return vertices
+
 def coaming_back_curve(plane, bounding_box, samples, offset=(0,0)):
     vertices = []
     scale = bounding_box[:2] * np.array((1, 0.25))
@@ -719,7 +733,7 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + len(self.keel) - 2)))
         perimeter.append(0)
         
-        self.bottom = Panel(vertices, np.array(triangles, dtype=np.int32), np.array(perimeter, dtype=np.int32), 2)
+        self.bottom = Panel(vertices, np.array(triangles, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2)
         self.features[Features.BOTTOM] = self.bottom
         
         # Construct hull side
@@ -735,7 +749,7 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + len(self.gunwale))))
         perimeter.append(0)
         
-        self.side = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 2)
+        self.side = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2)
         self.features[Features.SIDE] = self.side
         
         # Construct coaming base plate
@@ -764,25 +778,57 @@ class Model():
             recess_start = Line.between(v0, v1).where(0, recess_start_x)
             break
         
-        self.features[Features.COAMING_RIM] = coaming_opening2(coaming_base_plane, coaming_shape, samples, recess_gunwale_crossing)
+        #self.features[Features.COAMING_RIM] = coaming_opening2(coaming_base_plane, coaming_shape, samples, recess_gunwale_crossing)
         # Round back for recess
         coaming_base_back_shape = np.array((recess_gunwale_crossing + coaming_setback, recess_start[1] * 2))
         coaming_base_back_offset = np.array((-coaming_setback, 0))
         coaming_base_back_samples = len(self.gunwale) - cockpit_back # match back_deck_scallop_samples
         coaming_base_back = coaming_back_curve(coaming_base_plane, coaming_base_back_shape, coaming_base_back_samples, coaming_base_back_offset)
+        
+        coaming_cut_back_shape = np.array((recess_gunwale_crossing, coaming_shape[1]))
+        coaming_cut_back_offset = np.zeros(2, dtype=np.double)
+        coaming_cut_back_samples = coaming_base_back_samples # match for triangulation
+        coaming_cut_back = coaming_back_curve(coaming_base_plane, coaming_cut_back_shape, coaming_cut_back_samples, coaming_cut_back_offset)
+        
+        coaming_cut_front_shape = np.array((coaming_shape[0] - recess_gunwale_crossing, coaming_shape[1]))
+        coaming_cut_front_offset = np.array((recess_gunwale_crossing, 0))
+        coaming_cut_front_samples = 2 * coaming_cut_back_samples # just a guess
+        coaming_cut_front = coaming_front_curve(coaming_base_plane, coaming_cut_front_shape, coaming_cut_front_samples, coaming_cut_front_offset)
+        
+        coaming_cut_peak = coaming_base_plane.unmap((coaming_shape[0], 0))
+                
         coaming_base_front =  coaming_base_line.unmap(coaming_shape[0] + coaming_setback)
         coaming_base_front[1] = self.knee_panel_end[1]
-        vertices = np.array((recess_start.copy(), coaming_base_front))
-        vertices = np.concatenate((coaming_base_back, vertices))
-        vertices = np.concatenate((vertices, self.mirror * vertices))
+        
+        external_vertices = np.concatenate((coaming_base_back, np.linspace(recess_start, coaming_base_front, coaming_cut_front_samples)))
+        external_vertices = np.concatenate((external_vertices, np.flip(external_vertices, 0) * self.mirror))
+        
+        internal_vertices = np.concatenate((coaming_cut_back, coaming_cut_front))
+        coaming_peak_index = len(internal_vertices)
+        internal_vertices = np.concatenate((internal_vertices, (coaming_cut_peak,), np.flip(internal_vertices, 0) * self.mirror))
+        
+        assert(len(external_vertices) + 1 == len(internal_vertices))
+        
+        vertices = np.concatenate((external_vertices, internal_vertices))
+        
         indices = []
-        count = len(vertices) // 2
-        for index in range(count):
+        for index in range(len(external_vertices)):
+            indices.append(len(external_vertices) + index)
             indices.append(index)
-            indices.append(count + index)
-        perimeter = list(range(count))
-        perimeter.extend(reversed(range(count, count * 2)))
-        self.features[Features.COAMING_BASE] = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+        
+        # Patch in last triangle
+        indices.append(len(vertices) - 1)
+        indices.append(0)
+        indices.append(len(external_vertices))
+        
+        external_perimeter = list(range(len(external_vertices)))
+        external_perimeter.append(0)
+        
+        internal_perimeter = list(range(len(external_vertices), len(vertices)))
+        internal_perimeter.append(len(external_vertices))
+        perimeters = [ np.array(external_perimeter), np.array(internal_perimeter) ]
+
+        self.features[Features.COAMING_BASE] = Panel(vertices, np.array(indices, dtype=np.int32), perimeters, 1)
          
         # Ensure gunwale and front deck match before knee panel, then mirror
         #
@@ -809,7 +855,7 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + len(self.front_deck_seam))))
         perimeter[-1] = 0
         
-        self.front_deck = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+        self.front_deck = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 1)
         self.features[Features.FRONT_DECK] = self.front_deck
         
         # Construct knee deck inbetween gunwale and front deck seam
@@ -827,7 +873,7 @@ class Model():
         perimeter.extend(reversed(range(offset, len(vertices))))
         perimeter.append(0)
         
-        self.knee_deck = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 2)
+        self.knee_deck = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2)
         self.features[Features.KNEE_DECK] = self.knee_deck
         
         # Back deck
@@ -860,7 +906,7 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + count - 1)))
         perimeter.append(0)
         
-        self.back_deck = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+        self.back_deck = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 1)
         self.features[Features.BACK_DECK] = self.back_deck
         
         # Coaming recess
@@ -889,7 +935,7 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + count)))
         perimeter.append(0)
         
-        recess_panel = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+        recess_panel = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 1)
         self.features[Features.RECESS] = recess_panel
 
 def set_axes_equal(ax):
