@@ -584,50 +584,12 @@ class Panel():
 class Features(enum.Enum):
     BOTTOM = enum.auto()
     SIDE = enum.auto()
+    COAMING_BASE = enum.auto()
+    RECESS = enum.auto()
     FRONT_DECK = enum.auto()
+    COAMING_RIM = enum.auto()
     KNEE_DECK = enum.auto()
     BACK_DECK = enum.auto()
-    COAMING_BASE = enum.auto()
-    #COAMING_RIM = enum.auto()
-    RECESS = enum.auto()
-
-    
-def coaming_opening2(plane, bounding_box, samples, split_x):
-    # start super simple
-    split = split_x / bounding_box[0]
-    samples = max(40, samples*2)
-    vertices = []
-    scale = bounding_box[:2] * np.array((split, 0.25))
-    offset = np.array((scale[0], bounding_box[1] * 0.25))
-    segment_samples = int(np.ceil(samples * split))
-    for index in range(segment_samples):
-        angle = index * np.pi / (2 * segment_samples)
-        point = offset + scale * (-np.cos(angle), np.sin(angle))
-        vertices.append(plane.unmap(point))
-        
-    scale = bounding_box[:2] * np.array((1.0 - split, 0.5))
-    offset[1] = 0
-    segment_samples = int(np.ceil(samples * (1.0 - split)))
-    for index in range(segment_samples):
-        angle = index * np.pi / (2 * segment_samples)
-        point = offset + scale * (np.sin(angle), np.cos(angle))
-        vertices.append(plane.unmap(point))
-        
-    vertices.append(plane.unmap((bounding_box[0], 0)))
-    
-    count = len(vertices) - 1
-    
-    vertices = np.concatenate((vertices, vertices[:-1] * np.array((1, -1, 1))))
-    triangles = []
-    for index in range(count):
-        triangles.append(index)
-        triangles.append(count + 1 + index)
-    triangles.append(count)
-    perimeter = list(range(count + 1))
-    perimeter.extend(reversed(range(count + 1, count * 2 + 1)))
-    perimeter.append(0)
-    
-    return Panel(vertices, np.array(triangles, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], -1)
 
 def coaming_front_curve(plane, bounding_box, samples, offset=(0,0)):
     vertices = []
@@ -829,6 +791,62 @@ class Model():
         perimeters = [ np.array(external_perimeter), np.array(internal_perimeter) ]
 
         self.features[Features.COAMING_BASE] = Panel(vertices, np.array(indices, dtype=np.int32), perimeters, 1)
+        
+        # Construct coaming rim
+        #
+        coaming_rim_plane = Plane(coaming_base_plane.uv, coaming_base_plane.offset + coaming_base_plane.normal * -coaming_shape[2], coaming_base_plane.normal)
+        
+        coaming_inner_back_shape = np.array((recess_gunwale_crossing, coaming_shape[1]))
+        coaming_inner_back_offset = np.zeros(2, dtype=np.double)
+        coaming_inner_back_samples = coaming_base_back_samples # match for triangulation
+        coaming_inner_back = coaming_back_curve(coaming_rim_plane, coaming_inner_back_shape, coaming_inner_back_samples, coaming_inner_back_offset)
+        
+        coaming_inner_front_shape = np.array((coaming_shape[0] - recess_gunwale_crossing, coaming_shape[1]))
+        coaming_inner_front_offset = np.array((recess_gunwale_crossing, 0))
+        coaming_inner_front_samples = 2 * coaming_inner_back_samples # just a guess
+        coaming_inner_front = coaming_front_curve(coaming_rim_plane, coaming_inner_front_shape, coaming_inner_front_samples, coaming_inner_front_offset)
+        
+        coaming_inner_peak = coaming_rim_plane.unmap((coaming_shape[0], 0))
+        
+        coaming_outer_back_shape = np.array((recess_gunwale_crossing, coaming_shape[1])) + (coaming_setback, coaming_setback)
+        coaming_outer_back_offset = np.array((-coaming_setback, 0))
+        coaming_outer_back_samples = coaming_base_back_samples # match for triangulation
+        coaming_outer_back = coaming_back_curve(coaming_rim_plane, coaming_outer_back_shape, coaming_outer_back_samples, coaming_outer_back_offset)
+        
+        coaming_outer_front_shape = np.array((coaming_shape[0] - recess_gunwale_crossing, coaming_shape[1])) + (coaming_setback, coaming_setback)
+        coaming_outer_front_offset = np.array((recess_gunwale_crossing, 0))
+        coaming_outer_front_samples = 2 * coaming_outer_back_samples # just a guess
+        coaming_outer_front = coaming_front_curve(coaming_rim_plane, coaming_outer_front_shape, coaming_outer_front_samples, coaming_outer_front_offset)
+        
+        coaming_outer_peak = coaming_rim_plane.unmap((coaming_shape[0] + coaming_setback, 0))
+        
+        internal_vertices = np.concatenate((coaming_inner_back, coaming_inner_front))
+        internal_vertices = np.concatenate((internal_vertices, (coaming_inner_peak,), np.flip(internal_vertices, 0) * self.mirror))
+        
+        external_vertices = np.concatenate((coaming_outer_back, coaming_outer_front))
+        external_vertices = np.concatenate((external_vertices, (coaming_outer_peak,), np.flip(external_vertices, 0) * self.mirror))
+        
+        vertices = np.concatenate((external_vertices, internal_vertices))
+        
+        indices = []
+        for index in range(len(external_vertices)):
+            indices.append(index)
+            indices.append(len(external_vertices) + index)
+        
+        # Patch in last triangle
+        indices.append(0)
+        indices.append(len(external_vertices))
+        
+        external_perimeter = list(range(len(external_vertices)))
+        external_perimeter.append(0)
+        
+        internal_perimeter = list(range(len(external_vertices), len(vertices)))
+        internal_perimeter.append(len(external_vertices))
+        perimeters = [ np.array(external_perimeter), np.array(internal_perimeter) ]
+
+        self.features[Features.COAMING_RIM] = Panel(vertices, np.array(indices, dtype=np.int32), perimeters, 1)
+        
+        assert(len(internal_vertices) == len(external_vertices))
          
         # Ensure gunwale and front deck match before knee panel, then mirror
         #
@@ -837,8 +855,6 @@ class Model():
                 break
         knee_points = knee_gunwell_end - knee_panel_start + 2
         knee_line = np.linspace(self.knee_panel_start, coaming_base_front, knee_points)
-        #knee_line = np.linspace(self.knee_panel_start, coaming_base_front, 5 + 4 * samples)
-        #knee_line = np.linspace(self.knee_panel_start, self.knee_panel_end, 5 + 4 * samples)
         self.front_deck_seam = np.concatenate((self.gunwale[:knee_panel_start], knee_line))
         self.front_deck_seam_mirror = self.front_deck_seam * self.mirror
         
@@ -860,7 +876,6 @@ class Model():
         
         # Construct knee deck inbetween gunwale and front deck seam
         #
-        #vertices = np.concatenate((self.gunwale[knee_panel_start: cockpit_back + 1], self.front_deck_seam[knee_panel_start + 1:]))
         vertices = np.concatenate((self.gunwale[knee_panel_start: knee_gunwell_end + 1], self.front_deck_seam[knee_panel_start + 1:]))
         vertices[knee_gunwell_end - knee_panel_start] = recess_start
         indices = [0]
