@@ -585,6 +585,7 @@ class Features(enum.Enum):
     BACK_DECK = enum.auto()
     COAMING_BASE = enum.auto()
     COAMING_RIM = enum.auto()
+    RECESS = enum.auto()
 
     
 def coaming_opening2(plane, bounding_box, samples, split_x):
@@ -764,13 +765,14 @@ class Model():
             break
         
         self.features[Features.COAMING_RIM] = coaming_opening2(coaming_base_plane, coaming_shape, samples, recess_gunwale_crossing)
-        # TODO: round recess
+        # Round back for recess
         coaming_base_back_shape = np.array((recess_gunwale_crossing + coaming_setback, recess_start[1] * 2))
         coaming_base_back_offset = np.array((-coaming_setback, 0))
-        coaming_base_back = coaming_back_curve(coaming_base_plane, coaming_base_back_shape, 3 * samples, coaming_base_back_offset)
+        coaming_base_back_samples = len(self.gunwale) - cockpit_back # match back_deck_scallop_samples
+        coaming_base_back = coaming_back_curve(coaming_base_plane, coaming_base_back_shape, coaming_base_back_samples, coaming_base_back_offset)
         coaming_base_front =  coaming_base_line.unmap(coaming_shape[0] + coaming_setback)
         coaming_base_front[1] = self.knee_panel_end[1]
-        vertices = np.array((recess_start, coaming_base_front))
+        vertices = np.array((recess_start.copy(), coaming_base_front))
         vertices = np.concatenate((coaming_base_back, vertices))
         vertices = np.concatenate((vertices, self.mirror * vertices))
         indices = []
@@ -831,23 +833,27 @@ class Model():
         # Back deck
         #
         self.gunwale_mirror = self.gunwale * self.mirror
-        back_deck_center_points = self.gunwale[cockpit_back: cockpit_back + 2] * (1, 0, 1)
-        back_deck_center_line = Line.between(back_deck_center_points[1], back_deck_center_points[0])
+        back_deck_center_line = Line.between(self.gunwale[cockpit_back] * (1, 0, 1), recess_start * (1, 0, 1))
+        back_deck_center_line.offset = back_deck_center_line.where(0, coaming_back_center[0])
         back_deck_scallop_plane = Plane.from_lines(back_deck_center_line, Line.axis(3, 1))
         back_deck_scallop_shape = coaming_base_back_shape + (coaming_setback, 0)
         back_deck_scallop_offset = coaming_base_back_offset - (coaming_setback, 0)
         back_deck_scallop_samples = len(self.gunwale) - cockpit_back
+        back_deck_scallop = coaming_back_curve(back_deck_scallop_plane, back_deck_scallop_shape, back_deck_scallop_samples, back_deck_scallop_offset)
         
-        vertices = coaming_back_curve(back_deck_scallop_plane, back_deck_scallop_shape, back_deck_scallop_samples, back_deck_scallop_offset)
-        vertices.append(recess_start)
+        vertices = list(back_deck_scallop)
+        vertices.append(recess_start.copy())
         vertices = np.concatenate((vertices, self.gunwale[cockpit_back:]))
         count = len(vertices)
         vertices = np.concatenate((vertices, vertices[:-1] * self.mirror))
-        indices = []
-        for index in range(count - 1):
+        indices = [back_deck_scallop_samples]
+        for index in reversed(range(back_deck_scallop_samples)):
             indices.append(index)
+            indices.append(count - index - 1)
+        
+        for index in range(back_deck_scallop_samples):
             indices.append(count + index)
-        indices.append(count)
+            indices.append(len(vertices) - index - 1)
             
         perimeter = list(range(count))
         offset = len(perimeter)
@@ -857,7 +863,34 @@ class Model():
         self.back_deck = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
         self.features[Features.BACK_DECK] = self.back_deck
         
-    
+        # Coaming recess
+        #
+        assert(coaming_base_back_samples == back_deck_scallop_samples)
+        vertices = list(coaming_base_back)
+        vertices.append(recess_start)
+        vertices.extend(reversed(back_deck_scallop))
+        count = len(vertices)
+        vertices = np.concatenate((vertices, vertices * self.mirror))
+        
+        indices = [len(coaming_base_back)]
+        
+        for index in reversed(range(len(coaming_base_back))):
+            indices.append(index)
+            indices.append(count - index - 1)
+            
+        for index in range(len(coaming_base_back)):
+            indices.append(count + index)
+            indices.append(len(vertices) - index - 1)
+            
+        indices.append(count + len(coaming_base_back))
+            
+        perimeter = list(range(count))
+        offset = len(perimeter)
+        perimeter.extend(reversed(range(offset, offset + count)))
+        perimeter.append(0)
+        
+        recess_panel = Panel(vertices, np.array(indices, dtype=np.int32), np.array(perimeter, dtype=np.int32), 1)
+        self.features[Features.RECESS] = recess_panel
 
 def set_axes_equal(ax):
     """
