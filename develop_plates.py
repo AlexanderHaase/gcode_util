@@ -13,7 +13,7 @@ import functools
 import math
 import enum
 
-from abc import ABC
+import abc
 
 
 def sequence(vertices, indices):
@@ -65,7 +65,14 @@ def unit(vector):
 def sign(number):
     return -1 if number < 0 else 1
 
-
+def n_wise(iterable, n, stride=1):
+    '''
+    iterate over the iterable, N elements at a time e.g. pairwise or more.
+    '''
+    qty = len(iterable)
+    iterables = ( iterable[x:qty+x+1-n:stride] for x in range(n) )
+    yield from zip(*iterables)
+    
 def flatten(vertices, origin=None, basis = None, tolerance = 0.01):
     '''
     Vertices is a sequence of vertices that form a triangle strip (should be
@@ -148,6 +155,8 @@ def flatten(vertices, origin=None, basis = None, tolerance = 0.01):
         p1 = p0
         even = not(even)
         
+    # TODO: error is always more or less zero here. Instead we should look at unmap error(e.g. if points are reused).
+        
     return np.array(result), total_error, max_error  
 
 def reorient(origin, x_crossing, points):
@@ -221,20 +230,30 @@ class Line():
             
         return cls(a, v, scale)
         
+    def intersect(self, plane):
+        # solve T for dot(t*U + Ol - Op, N) = 0
+        #
+        # Let Ol - Op = C
+        # t*dot(U,N)  + dot(C,N) = 0
+        # t*dot(U,N) = - dot(C, N)
+        # t = - dot(C,N)/dot(U,N) 
+        c = self.offset - plane.offset
+        return - np.dot(c, plane.normal) / (self.scale * np.dot(self.unit, plane.normal))
+        
     def nearest(self, other):
         '''
         find the pair of points closest to intersection
         '''
-        # Min distance when the line between the two is perpendicular to both (dot product)
-        # u1*(m1*t1 + c1 - m2*t2 - c2) = 0
-        # u2*(m1*t1 + c1 - m2*t2 - c2) = 0
-        #
-        # u1*(m1*t1 + c1 - c2) / (u1*m2) = t2
-        # u2*(m1*t1 + c1 - c2) / (u2*m2) = t2
-        # u1*(m1*t1 + c1 - c2) / (u1*m2) = u2*(m1*t1 + c1 - c2) / (u2*m2)
-        # u1*(m1*t1 + c1 - c2) * (u2*m2) = u2*(m1*t1 + c1 - c2) * (u1*m2)
-        # (u1*(u2*m2) - u2*(u1*m2)) * (m1*t1 + c1 - c2) = 0
+        # U1 x U2 = N
+        # C = O1 - O2
+        # t1 = - dot(C,N)/dot(U1*s1,N) 
+        # t2 = + dot(C,N)/dot(U2*s2,N) 
+        normal = np.cross(self.unit, other.unit)
+        c = self.offset - other.offset
+        t1 = - np.dot(c, plane.normal) / (self.scale * np.dot(self.unit, normal))
+        t2 =   np.dot(c, plane.normal) / (other.scale * np.dot(other.unit, normal))
         
+        return (t1, t2)
     
 class Plane():
 
@@ -273,8 +292,9 @@ class Plane():
             offset = u.offset
         return cls(uv, offset, normal)
         
-    
-
+    def distance(self, point):
+        return np.dot(self.normal, point - self.offset)
+        
 class Arc():
 
     def __init__(self, a, b, c):
@@ -502,14 +522,16 @@ class Panel():
     Single panel to be developed
     '''
 
-    __slots__ = ('vertices', 'triangles', 'perimeters', 'points', 'quantity')
+    __slots__ = ('vertices', 'triangles', 'perimeters', 'points', 'quantity', 'mirrors')
     
-    def __init__(self, vertices, triangles, perimeters, quantity=1, points=None):
+    def __init__(self, vertices, triangles, perimeters, quantity=1, points=None, mirrors=tuple()):
         self.vertices = vertices
         self.triangles = triangles
         self.perimeters = perimeters
         self.quantity = quantity
         self.points = points
+        self.mirrors = [np.ones(3)]
+        self.mirrors.extend(mirrors)
         
     def flatten(self, tolerance, offset=None, mirror=True):
         triangle_strip = sequence(self.vertices, self.triangles)
@@ -573,25 +595,16 @@ class Panel():
         triangle_strip = sequence(self.vertices, self.triangles) * scale
         perimeters = [sequence(self.vertices, perimeter) * scale for perimeter in self.perimeters]
         if z:
-            ax.plot(triangle_strip[:, 0], triangle_strip[:, 1], triangle_strip[:, 2])
+            if len(triangle_strip):
+                ax.plot(triangle_strip[:, 0], triangle_strip[:, 1], triangle_strip[:, 2])
             for perimeter in perimeters:
                 ax.plot(perimeter[:, 0], perimeter[:, 1], perimeter[:, 2])
         else:
-            ax.plot(triangle_strip[:, 0], triangle_strip[:, 1])
+            if len(triangle_strip):
+                ax.plot(triangle_strip[:, 0], triangle_strip[:, 1])
             for perimeter in perimeters:
                 ax.plot(perimeter[:, 0], perimeter[:, 1])
-            
-class Features(enum.Enum):
-    BOTTOM = enum.auto()
-    SIDE = enum.auto()
-    COAMING_BASE = enum.auto()
-    RECESS = enum.auto()
-    FRONT_DECK = enum.auto()
-    COAMING_SPACER = enum.auto()
-    COAMING_RIM = enum.auto()
-    KNEE_DECK = enum.auto()
-    BACK_DECK = enum.auto()
-
+                
 def coaming_front_curve(plane, bounding_box, samples, offset=(0,0)):
     vertices = []
     scale = bounding_box[:2] * np.array((1.0, 0.5))
@@ -673,6 +686,245 @@ def coaming_ring(plane, bounding_box, samples, split_x, diameter, qty=1, offset=
         perimeters = [ np.array(external_perimeter), np.array(internal_perimeter) ]
 
         return Panel(vertices, np.array(indices, dtype=np.int32), perimeters, qty)
+
+
+class Part():
+    """
+    A shape to be machined, or an intermediate step on a shape to be machined
+    """
+    __slots__ = ("perimeter", "holes")
+    
+    def __init__(self, perimeter, holes = None):
+        self.perimeter = perimeter
+        self.holes = holes or []
+        
+        
+    def translate(self, offset):
+        perimeter = self.perimeter + offset
+        holes = [ hole + offset for hole in self.holes ]
+        return Part(perimeter, holes)
+        
+    def rotate(self, angle, center=np.array((0, 0))):
+        r = np.full((2, 2), np.cos(angle))
+        sin_a = np.sin(angle)
+        r = -sin_a
+        r = sin_a
+        
+        perimeter = (self.perimeter - center) * r + center
+        holes = [ (hole - center) * r + center for hole in holes ]
+        return Part(perimeter, holes)
+        
+class Node(abc.ABC):
+    """
+    An operation that produces zero or more parts.
+    """
+    
+    __slots__ = ("parent", "children")
+    
+    def __init__(self, parent):
+        self.parent = parent
+        self.children = []
+        parent.children.append(self)
+        
+    @abc.abstractmethod
+    def parts(self):
+        return None
+
+class Cache(Node):
+    __slots__ = ("cached_parts",)
+    def __init__(self, parent, offset):
+        super().__init__(parent)
+        self.cached_parts = None
+        
+    def parts(self):
+        if self.cached_parts is None:
+            self.cached_parts = self.parent.parts()
+        return self.cached_parts
+        
+class Flatten(Node):
+    """
+    Maps a panel into a 2d part
+    """
+    
+    __slots__ = ("panel", "tolerance")
+    
+    def __init__(self, panel, tolerance):
+        super().__init__(None)
+        self.panel = panel
+        self.tolerance = tolerance
+        
+    def parts(self):
+        self.panel.flatten(self.tolerance)
+        perimeter = sequence(self.panel.vertices, self.panel.perimeters[0])
+        holes = [sequence(self.panel.vertices, perimeter) for perimeter in self.panel.perimeters[1:]]
+        return [Part(perimeter, holes)]
+        
+class Translate(Node):
+
+    __slots__ = ("offset",)
+    
+    def __init__(self, parent, offset):
+        super().__init__(parent)
+        self.offset = offset
+        
+    def parts(self):
+        return [part.translate(self.offset) for part in self.parent.parts()]
+        
+class Rotate(Node):
+
+    __slots__ = ("angle",)
+    
+    def __init__(self, parent, angle):
+        super().__init__(parent)
+        self.angle = angle
+        
+    def parts(self):
+        return [part.rotate(self.angle) for part in self.parent.parts()]
+
+def finger_joint(begin, end, length, width, samples_per_arc):
+    """
+    Creates a finger joint
+    """
+    
+    
+def find_plane_intersections(plane, perimeter, tolerance = 1e-16):
+    """
+    Points likely come out in linear chain for a perimeter of an intersection
+    """
+    points = []
+    for v0, v1 in n_wise(perimeter,2):
+        d0 = plane.distance(v0)
+        d1 = plane.distance(v1)
+        
+        if (d0 < -tolerance and d1 < -tolerance) or (d0 > tolerance and d1 > tolerance):
+            continue
+            
+        if abs(d1) < tolerance:
+            points.append(v1)
+            continue
+            
+        if abs(d0) < tolerance:
+            if not points or np.linalg.norm(points[-1] - v0) > tolerance:
+                points.append(v0)
+            continue
+            
+        line = Line.between(v0, v1)
+        t = line.intersect(plane)
+        point = line.unmap(t)
+        assert(not np.isnan(point).any())
+        points.append(point)
+        
+    # handle perimeter wrap (e.g vertices[0] == vertices[-1])
+    if len(points) > 1 and np.linalg.norm(points[0] - points[-1]) < tolerance:
+        points.pop()
+    
+    return points
+    
+
+class Bulkhead():
+
+    def __init__(self, plane, tolerance=1e-16):
+        self.plane = plane
+        self.segments = []
+        self.tolerance = tolerance
+        
+    def add_panel(self, panel):
+        for index, perimeter in enumerate(panel.perimeters):
+            vertices = sequence(panel.vertices, perimeter)
+            points = find_plane_intersections(self.plane, vertices)
+            if index and points:
+                logging.warning("Ignoring presumed hole!")
+            if not points:
+                continue
+            
+            if len(points) & 1:
+                raise NotImplementedError(f"Unsupported odd incidence number: {len(points)}")
+            
+            # Determine point pairing (longest pairwise distance is invalid)
+            normal_longest = 0
+            for v0, v1 in n_wise(points, 2, stride=2):
+                normal_longest = max(normal_longest, np.linalg.norm(v1 - v0))
+                
+            alternate = [points[-1]]
+            alternate.extend(points[:-1])
+            
+            alternate_longest = 0
+            for v0, v1 in n_wise(alternate, 2, stride=2):
+                alternate_longest = max(alternate_longest, np.linalg.norm(v1 - v0))
+            
+            if alternate_longest < normal_longest:
+                points = alternate
+                
+            for v0, v1 in n_wise(points, 2, stride=2):
+                for mirror in panel.mirrors:
+                    self.segments.append([v0 * mirror, v1 * mirror])
+                                
+    def perimeter(self):
+        options = []
+        combined = self.segments.pop()
+        while self.segments:
+            unmatched = []
+            for segment in self.segments:
+                if np.linalg.norm(segment[0] - combined[0]) < self.tolerance:
+                    combined = list(reversed(combined))
+                    combined.extend(segment[1:])
+                    
+                elif np.linalg.norm(segment[0] - combined[-1]) < self.tolerance:
+                    combined.extend(segment[1:])
+                    
+                elif np.linalg.norm(segment[-1] - combined[0]) < self.tolerance:
+                    segment.extend(combined[1:])
+                    combined = segment
+                    
+                elif np.linalg.norm(segment[-1] - combined[-1]) < self.tolerance:
+                    combined.extend(reversed(segment[:-1]))
+                    
+                else:
+                    unmatched.append(segment)
+            
+            if len(unmatched) == len(self.segments):
+                options.append(combined)
+                combined = unmatched.pop()
+                
+            self.segments = unmatched
+        
+        options.append(combined)
+        
+        for option in options:
+            if len(option) > len(combined):
+                combined = option
+                
+        if len(options) > 1:
+            logging.warning("Ignoring options: %s", options)
+            
+        return np.array(combined)
+        
+    def to_panel(self):
+        # TODO: setback for material thickness
+        # TODO: prune duplicate 0 or -1 element.
+        vertices = self.perimeter()
+        triangles = np.array([], dtype=np.int32)
+        perimeter = np.array(list(range(len(vertices))), dtype=np.int32)
+        points = np.array([self.plane.map(vertex, self.tolerance) for vertex in vertices])
+        return Panel(vertices, triangles, [perimeter], 1, points)
+            
+class Features(enum.Enum):
+    BOTTOM = enum.auto()
+    SIDE = enum.auto()
+    COAMING_BASE = enum.auto()
+    RECESS = enum.auto()
+    FRONT_DECK = enum.auto()
+    COAMING_SPACER = enum.auto()
+    COAMING_RIM = enum.auto()
+    KNEE_DECK = enum.auto()
+    BACK_DECK = enum.auto()
+    COCKPIT_BACK = enum.auto()
+    COCKPIT_FRONT = enum.auto()
+    DAY_BULKHEAD = enum.auto()
+    FRONT_BULKHEAD = enum.auto()
+    BACK_BULKHEAD =  enum.auto()
+    
+body_features = (Features.BOTTOM, Features.SIDE, Features.COAMING_BASE, Features.RECESS, Features.FRONT_DECK, Features.KNEE_DECK, Features.BACK_DECK) 
     
 class Model():
     ref_gunwale = np.array([
@@ -724,7 +976,7 @@ class Model():
 
     mirror = np.array([1.0, -1.0, 1.0])
         
-    def __init__(self, samples=3):
+    def __init__(self, samples=3, tolerance=1e-6):
         self.features = {}
         
         # interpolate lines from reference model for improved output detail
@@ -757,7 +1009,7 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + len(self.keel) - 2)))
         perimeter.append(0)
         
-        self.bottom = Panel(vertices, np.array(triangles, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2)
+        self.bottom = Panel(vertices, np.array(triangles, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2, mirrors=(self.mirror,))
         self.features[Features.BOTTOM] = self.bottom
         
         # Construct hull side
@@ -773,7 +1025,7 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + len(self.gunwale))))
         perimeter.append(0)
         
-        self.side = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2)
+        self.side = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2, mirrors=(self.mirror,))
         self.features[Features.SIDE] = self.side
         
         # Construct coaming base plate
@@ -906,7 +1158,7 @@ class Model():
         perimeter.extend(reversed(range(offset, len(vertices))))
         perimeter.append(0)
         
-        self.knee_deck = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2)
+        self.knee_deck = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2, mirrors=(self.mirror,))
         self.features[Features.KNEE_DECK] = self.knee_deck
         
         # Back deck
@@ -970,6 +1222,36 @@ class Model():
         
         recess_panel = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 1)
         self.features[Features.RECESS] = recess_panel
+        
+        # Bulkheads
+        #
+        # TODO: tilt
+        cockpit_back_offset = coaming_back_center.copy()
+        cockpit_back_plane = Plane.from_lines(Line.axis(3, 1), Line.axis(3, 2), cockpit_back_offset)
+        cockpit_front_offset = cockpit_back_offset - np.array((48/12, 0, 0))
+        cockpit_front_plane = Plane.from_lines(Line.axis(3, 1), Line.axis(3, 2), cockpit_front_offset)
+        day_bulkhead_offset = cockpit_back_offset + np.array((12/12, 0, 0))
+        day_bulkhead_plane = Plane.from_lines(Line.axis(3, 1), Line.axis(3, 2), day_bulkhead_offset)
+        front_bulkhead_offset = cockpit_front_offset - np.array((36/12, 0, 0))
+        front_bulkhead_plane = Plane.from_lines(Line.axis(3, 1), Line.axis(3, 2), front_bulkhead_offset)
+        back_bulkhead_offset = day_bulkhead_offset + np.array((36/12, 0, 0))
+        back_bulkhead_plane = Plane.from_lines(Line.axis(3, 1), Line.axis(3, 2), back_bulkhead_offset)
+        
+        self.bulkheads = {
+            Features.BACK_BULKHEAD: Bulkhead(back_bulkhead_plane, tolerance),
+            Features.FRONT_BULKHEAD: Bulkhead(front_bulkhead_plane, tolerance),
+            Features.DAY_BULKHEAD: Bulkhead(day_bulkhead_plane, tolerance),
+            Features.COCKPIT_BACK: Bulkhead(cockpit_back_plane, tolerance),
+            Features.COCKPIT_FRONT: Bulkhead(cockpit_front_plane, tolerance)
+        }
+        
+        for feature in body_features:
+            for bulkhead in self.bulkheads.values():
+                bulkhead.add_panel(self.features[feature])
+        
+           
+        for feature, bulkhead in self.bulkheads.items():
+            self.features[feature] = bulkhead.to_panel()
 
 def set_axes_equal(ax):
     """
@@ -1020,25 +1302,9 @@ if __name__ == "__main__":
     log_level = getattr(logging, args.log_level.upper())
     logging.basicConfig(level=log_level)
     
-    model = Model(args.interpolate)
-    #triangle_strip = sequence(model.front_deck.vertices, model.front_deck.triangles)
-    #points, total_error, max_error = flatten(triangle_strip, tolerance=args.tolerance)
-    #logging.info("Total error: %f, max error: %f", total_error, max_error)
-    
-    #points = reorient(points[0], points[-1] + points[-2], points)
-    #points *= np.array((1.0, -1.0))
-    #points += np.array((0.0, 2.0))
+    model = Model(args.interpolate, args.tolerance)
     
     ax = plt.figure().add_subplot(projection='3d')
-    
-    #ax.plot(points[:, 0], points[:, 1], np.zeros(np.shape(points)[0]))
-    #ax.plot(triangle_strip[:, 0], triangle_strip[:, 1], triangle_strip[:, 2])
-    
-    #perim_2d = sequence(points, project(model.front_deck.perimeter, model.front_deck.triangles))
-    #ax.plot(perim_2d[:, 0], perim_2d[:, 1], np.zeros(np.shape(perim_2d)[0]))
-    
-    #perim_3d = sequence(model.front_deck.vertices, model.front_deck.perimeter)
-    #ax.plot(perim_3d[:, 0], perim_3d[:, 1], perim_3d[:, 2])
     
     if args.feature:
         features = (Features[feature.upper()] for feature in args.feature)
@@ -1050,7 +1316,8 @@ if __name__ == "__main__":
     area = 0.0
     for feature in features:
         panel = model.features[feature]
-        panel.flatten(args.tolerance)
+        if panel.points is None:
+            panel.flatten(args.tolerance)
         if args.vertices:
             panel.plot_vertices(ax, z=True)
             if args.mirror and panel.quantity == 2:
@@ -1059,8 +1326,11 @@ if __name__ == "__main__":
             panel.plot_points(ax, z=True)
             if args.mirror and panel.quantity == 2:
                 panel.plot_points(ax, z=True, scale=model.mirror)
-        area += panel.area() * panel.quantity
+        #area += panel.area() * panel.quantity
         
+    #bulkhead = np.concatenate(model.cockpit_back.segments)
+    #ax.scatter(bulkhead[:, 0], bulkhead[:, 1], bulkhead[:, 2])
+    
     logging.info("Area: %f", area)
     set_axes_equal(ax)
     plt.show()
