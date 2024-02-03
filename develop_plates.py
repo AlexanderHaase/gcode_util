@@ -246,12 +246,46 @@ class Line():
         '''
         # U1 x U2 = N
         # C = O1 - O2
-        # t1 = - dot(C,N)/dot(U1*s1,N) 
-        # t2 = + dot(C,N)/dot(U2*s2,N) 
-        normal = np.cross(self.unit, other.unit)
+        #
+        # Minimize ||t1*U1 + O1 - t2*U2 - O2|| wrt t0, t1
+        # F(t1, t2) = (t1*u1x - t2*u2x + cx)**2 + ...
+        # dF/dt1 = 2*u1x*(t1*u1x - t2*u2x + cx) + ... = 0
+        # 0 = 2*(t1*dot(U1, U1) - t2*dot(U1, U2) + dot(C, U1))
+        #
+        # ==> t1 = (t2*dot(U1, U2) - dot(C, U1)) / dot(U1, U1)
+        #
+        # dF/dt2 = -2*u2x*(t1*u1x - t2*u2x + cx) + ... = 0
+        # 0 = t2*dot(U2, U2) -  t1*dot(U1, U2) - dot(C, U2)
+        #
+        # substitute t1
+        #
+        # 0 = t2*dot(U2, U2) -  (t2*dot(U1, U2) - dot(C, U1))*dot(U1, U2)/dot(U1, U1) - dot(C, U2)
+        # 0 = t2*dot(U2, U2)*dot(U1, U1) - t2*dot(U1, U2)**2 + dot(C, U1)*dot(U1, U2) - dot(C, U2)*dot(U1, U1)
+        # 0 = t2*(dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2) + dot(C, U1)*dot(U1, U2) - dot(C, U2)*dot(U1, U1)
+        # t2*(dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2) = - dot(C, U1)*dot(U1, U2) + dot(C, U2)*dot(U1, U1)
+        # t2 = (dot(C, U2)*dot(U1, U1) - dot(C, U1)*dot(U1, U2)) / (dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2)
+        #
+        # Solve for t1
+        #
+        # t1 = (t2*dot(U1, U2) - dot(C, U1)) / dot(U1, U1)
+        # t1*dot(U1, U1) + dot(C, U1) = t2*dot(U1, U2)
+        # t1*dot(U1, U1) + dot(C, U1) = dot(U1, U2) * (dot(C, U2)*dot(U1, U1) - dot(C, U1)*dot(U1, U2)) / (dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2)
+        # t1*dot(U1, U1) + dot(C, U1) = (dot(C, U2)*dot(U1, U1)*dot(U1, U2) - dot(C, U1)*dot(U1, U2)**2) / (dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2)
+        # t1*dot(U1, U1) = (dot(C, U2)*dot(U1, U1)*dot(U1, U2) - dot(C, U1)*dot(U1, U2)**2 - dot(C, U1)*(dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2)) / (dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2)
+        # t1*dot(U1, U1) = (dot(C, U2)*dot(U1, U1)*dot(U1, U2) - dot(C, U1)*dot(U2, U2)*dot(U1, U1)) / (dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2)
+        # t1 = (dot(C, U2)*dot(U1, U2) - dot(C, U1)*dot(U2, U2)) / (dot(U2, U2)*dot(U1, U1) - dot(U1, U2)**2)
+        
         c = self.offset - other.offset
-        t1 = - np.dot(c, plane.normal) / (self.scale * np.dot(self.unit, normal))
-        t2 =   np.dot(c, plane.normal) / (other.scale * np.dot(other.unit, normal))
+        u1 = self.unit * self.scale
+        u2 = other.unit * other.scale
+        u1u1 = np.dot(u1, u1)
+        u1u2 = np.dot(u1, u2)
+        u2u2 = np.dot(u2, u2)
+        u1c = np.dot(u1, c)
+        u2c = np.dot(u2, c)
+        
+        t2 = (u2c*u1u1 - u1c*u1u2)/(u2u2*u1u1 - u1u2**2)
+        t1 = (t2*u1u2 - u1c)/u1u1
         
         return (t1, t2)
     
@@ -262,7 +296,7 @@ class Plane():
     def __init__(self, uv, offset, normal):
         self.uv = uv
         self.offset = offset
-        self.normal = normal
+        self.normal = normal / np.linalg.norm(normal)
         
     @classmethod
     def from_points(cls, a, b, c):
@@ -823,9 +857,10 @@ def find_plane_intersections(plane, perimeter, tolerance = 1e-16):
 
 class Bulkhead():
 
-    def __init__(self, plane, tolerance=1e-16):
+    def __init__(self, plane, setback=0, tolerance=1e-10):
         self.plane = plane
         self.segments = []
+        self.setback = setback
         self.tolerance = tolerance
         
     def add_panel(self, panel):
@@ -857,56 +892,194 @@ class Bulkhead():
                 
             for v0, v1 in n_wise(points, 2, stride=2):
                 for mirror in panel.mirrors:
-                    self.segments.append([v0 * mirror, v1 * mirror])
+                    self.segments.append(np.array((v0 * mirror, v1 * mirror)))
                                 
-    def perimeter(self):
+    def solve(self):
+        # Combine all coincident line segments into "options"
+        #
         options = []
         combined = self.segments.pop()
         while self.segments:
             unmatched = []
             for segment in self.segments:
                 if np.linalg.norm(segment[0] - combined[0]) < self.tolerance:
-                    combined = list(reversed(combined))
-                    combined.extend(segment[1:])
+                    combined = np.concatenate((np.flip(combined, 0), segment[1:]))
                     
                 elif np.linalg.norm(segment[0] - combined[-1]) < self.tolerance:
-                    combined.extend(segment[1:])
+                    combined = np.concatenate((combined, segment[1:]))
                     
                 elif np.linalg.norm(segment[-1] - combined[0]) < self.tolerance:
-                    segment.extend(combined[1:])
-                    combined = segment
+                    combined = np.concatenate((segment, combined[1:]))
                     
                 elif np.linalg.norm(segment[-1] - combined[-1]) < self.tolerance:
-                    combined.extend(reversed(segment[:-1]))
+                    combined = np.concatenate((combined, np.flip(segment[:-1], 0)))
                     
                 else:
                     unmatched.append(segment)
             
             if len(unmatched) == len(self.segments):
-                options.append(combined)
+                # Reject non-cyclic line segments
+                #
+                if np.linalg.norm(combined[0] - combined[-1]) > self.tolerance:
+                    logging.debug("Discarding incomplete bulkhead option:\n%s", combined)
+                else:
+                    options.append(combined)
+                
                 combined = unmatched.pop()
                 
             self.segments = unmatched
+            
+
+        if np.linalg.norm(combined[0] - combined[-1]) > self.tolerance:
+            # Reject non-cyclic line segments
+            #
+            logging.debug("Discarding incomplete bulkhead option:\n%s", combined)
+            combined = options.pop()
         
-        options.append(combined)
-        
+        # Accept the most complex perimeter as presumably the best (but warn the humans)
+        #
         for option in options:
             if len(option) > len(combined):
+                logging.info("Ignoring bulkhead option:\n%s", combined)
                 combined = option
-                
-        if len(options) > 1:
-            logging.warning("Ignoring options: %s", options)
+            else:
+                logging.info("Ignoring bulkhead option:\n%s", option)
             
-        return np.array(combined)
+        self.vertices = combined[:-1]
+        
+        
+    def sort_ccw(self, axis=2):
+        '''
+        Re-order the vertices in ccw order, setup for graham's scan convex hull
+        '''
+        stack = []
+        
+        # Scan for the min_x point and determine the ordering of the vertices relative to the plane
+        #
+        v0 = self.vertices[-2]
+        v1 = self.vertices[-1]
+        
+        min_value = self.vertices[0]
+        min_index = 0
+        
+        angle = 0
+        
+        for index, v2 in enumerate(self.vertices):
+            if v2[axis] < min_value[axis]:
+                min_value = v2
+                min_index = index
+                
+            corner = self.Corner(v0, v1, v2, self.plane.normal)
+            angle += corner.angle()
+            
+            stack.append(corner)
+            
+            v0 = v1
+            v1 = v2
+            
+        # Reverse order if needed
+        #
+        if angle < 0:
+            self.vertices = np.flip(self.vertices, 0)
+            stack.reverse()
+            min_index = len(self.vertices) - 1 - min_index
+ 
+        # Reorder points from min_x
+        #
+        if min_index > 0:
+            self.vertices = np.concatenate((self.vertices[min_index:], self.vertices[:min_index]))
+            new_stack = list(stack[min_index:])
+            new_stack.extend(stack[:min_index])
+            stack = new_stack
+        
+        return stack
+        
+    class Corner():
+        __slots__ = ('v0', 'v1', 'v2', 'l10', 'l12', 'cp', 'mag')
+        
+        def __init__(self, v0, v1, v2, normal):
+            self.v0 = v0
+            self.v1 = v1
+            self.v2 = v2
+            self.l10 = v0 - v1
+            self.l12 = v2 - v1
+            self.cp = np.cross(self.l10, self.l12)
+            self.mag = np.dot(self.cp, normal)
+         
+        def angle(self):
+            d10 = np.linalg.norm(self.l10)
+            d12 = np.linalg.norm(self.l12)
+          
+            return np.arcsin(self.mag/(d10 * d12))
+        
+    def convex_hull(self):
+        '''
+        Graham's scan, given that we already have sorted points and clockwise
+        is sign(cross product * normal).
+        TODO: move this into a more generic scope
+        '''
+        raise NotImplementedError
+        hull = []
+        
+        v0 = self.vertices[-1]
+        v1 = self.vertices[0]        
+        for v2 in self.vertices[1:]:
+            l10 = v0 - v1
+            l12 = v2 - v1
+            cp = np.cross(l10, l12)
+            direction = np.dot(cp, self.plane.normal)
+            ccw = direction <= 0 # Allow for straight lines
+            
+            if ccw:
+                hull.append(v0)
+                v0 = v1
+            v1 = v2
+            
+        
+    def offset(self):
+        '''
+        move line segments perpendicularly toward inside, then recover vertices from intersections
+        Assumes vertices are in CCW order relative to plane.
+        '''
+        
+        lines = []
+        
+        # offset lines
+        #
+        v0 = self.vertices[-1]
+        for v1 in self.vertices:
+            line = Line.between(v0, v1)
+            normal = np.cross(line.unit, self.plane.normal)
+            line.offset += normal * self.setback
+            lines.append(line)
+            v0 = v1
+            
+        vertices = []
+        
+        # recover vertices
+        #
+        l0 = lines[-1]
+        for l1 in lines:
+            d0, d1 = l0.nearest(l1)
+            separation = np.linalg.norm(l0.unmap(d0) - l1.unmap(d1))
+            assert(separation < self.tolerance)
+            vertices.append(l0.unmap(d0))
+            l0 = l1
+            
+        self.vertices = np.array(vertices)
         
     def to_panel(self):
         # TODO: setback for material thickness
-        # TODO: prune duplicate 0 or -1 element.
-        vertices = self.perimeter()
+        self.solve()
+        self.sort_ccw()
+        self.offset()
+        vertices = self.vertices
         triangles = np.array([], dtype=np.int32)
-        perimeter = np.array(list(range(len(vertices))), dtype=np.int32)
-        points = np.array([self.plane.map(vertex, self.tolerance) for vertex in vertices])
-        return Panel(vertices, triangles, [perimeter], 1, points)
+        perimeter = list(range(len(vertices)))
+        perimeter.append(0)
+        perimeter = np.array(perimeter, dtype=np.int32)
+        points = np.array([self.plane.map(vertex, self.tolerance) for vertex in self.vertices])
+        return Panel(self.vertices, triangles, [perimeter], 1, points)
             
 class Features(enum.Enum):
     BOTTOM = enum.auto()
@@ -1237,12 +1410,14 @@ class Model():
         back_bulkhead_offset = day_bulkhead_offset + np.array((36/12, 0, 0))
         back_bulkhead_plane = Plane.from_lines(Line.axis(3, 1), Line.axis(3, 2), back_bulkhead_offset)
         
+        setback = 3 / (25.4*12)
+        
         self.bulkheads = {
-            Features.BACK_BULKHEAD: Bulkhead(back_bulkhead_plane, tolerance),
-            Features.FRONT_BULKHEAD: Bulkhead(front_bulkhead_plane, tolerance),
-            Features.DAY_BULKHEAD: Bulkhead(day_bulkhead_plane, tolerance),
-            Features.COCKPIT_BACK: Bulkhead(cockpit_back_plane, tolerance),
-            Features.COCKPIT_FRONT: Bulkhead(cockpit_front_plane, tolerance)
+            Features.BACK_BULKHEAD: Bulkhead(back_bulkhead_plane, setback, tolerance),
+            Features.FRONT_BULKHEAD: Bulkhead(front_bulkhead_plane, setback, tolerance),
+            Features.DAY_BULKHEAD: Bulkhead(day_bulkhead_plane, setback, tolerance),
+            Features.COCKPIT_BACK: Bulkhead(cockpit_back_plane, setback, tolerance),
+            Features.COCKPIT_FRONT: Bulkhead(cockpit_front_plane, setback, tolerance)
         }
         
         for feature in body_features:
@@ -1290,7 +1465,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Flatten geometry for tortured plywood construction")
     parser.add_argument("-l", "--log-level", default="warn", choices=("warn", "info", "error", "critical", "debug"), help="Log level")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debugging mode")
-    parser.add_argument("-t", "--tolerance", type=float, default=0.01, help="Max error tolerance")
+    parser.add_argument("-t", "--tolerance", type=float, default=0.001, help="Max error tolerance")
     parser.add_argument("-i", "--interpolate", type=int, default=0, help="Number of segments to interpolate")
     parser.add_argument("-p", "--points", action="store_true", help ="Graph points")
     parser.add_argument("-v", "--vertices", action="store_true", help ="Graph vertices")
@@ -1333,5 +1508,6 @@ if __name__ == "__main__":
     
     logging.info("Area: %f", area)
     set_axes_equal(ax)
+    plt.tight_layout()
     plt.show()
     
