@@ -49,6 +49,10 @@ class Panel():
     def area(self):
         if self.points is None:
             raise ValueError("Cannot plot non-existant points!")
+        # TODO: figure out bulkhead triangulation
+        #
+        if not len(self.triangles):
+            return 0 
         triangles = sequence(self.points, self.triangles)
         p0, p1 = triangles[:2]
         
@@ -70,14 +74,18 @@ class Panel():
             x_guess = 0 #-np.min(self.points[:, 0]) #-abs(np.mean(self.vertices[:, 1]))
             offset = np.array((x_guess, 0, z_guess))
             
-        points_2d = sequence(self.points, self.triangles) * scale + offset[:2]
+        if len(self.triangles):
+            points_2d = sequence(self.points, self.triangles) * scale + offset[:2]
+        
         perimeters = [sequence(self.points, perimeter) * scale  + offset[:2] for perimeter in self.perimeters]
         if z:
-            ax.plot(points_2d[:, 0], points_2d[:, 1], np.full(np.shape(points_2d)[0], offset[2]))
+            if len(self.triangles):
+                ax.plot(points_2d[:, 0], points_2d[:, 1], np.full(np.shape(points_2d)[0], offset[2]))
             for perimeter in perimeters:
                 ax.plot(perimeter[:, 0], perimeter[:, 1], np.full(np.shape(perimeter)[0], offset[2]))
         else:
-            ax.plot(points_2d[:, 0], points_2d[:, 1])
+            if len(self.triangles):
+                ax.plot(points_2d[:, 0], points_2d[:, 1])
             for perimeter in perimeters:
                 ax.plot(perimeter[:, 0], perimeter[:, 1])
         

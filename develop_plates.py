@@ -261,6 +261,7 @@ class Model():
         for index in range(1, knee_gunwell_end - knee_panel_start + 1):
             indices.append(index)
             indices.append(knee_gunwell_end - knee_panel_start + index)
+        indices.append(len(vertices) - 1)
             
         perimeter = list(range(knee_gunwell_end - knee_panel_start + 1))
         offset = len(perimeter)
@@ -437,11 +438,8 @@ if __name__ == "__main__":
             panel.plot_points(ax, z=True)
             if args.mirror and panel.quantity == 2:
                 panel.plot_points(ax, z=True, scale=model.mirror)
-        #area += panel.area() * panel.quantity
+        area += panel.area() * panel.quantity
         
-    #bulkhead = np.concatenate(model.cockpit_back.segments)
-    #ax.scatter(bulkhead[:, 0], bulkhead[:, 1], bulkhead[:, 2])
-    
     logging.info("Area: %f", area)
     set_axes_equal(ax)
     plt.tight_layout()

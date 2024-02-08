@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-from collections import OrderedDict
 import logging
 import numpy as np
 import math
@@ -189,7 +188,7 @@ class Line():
         b = points[:, 1:]
         m, c = np.linalg.lstsq(a, b)[0]
         # TODO: handle 3d lines
-        return cls(np.array((1, c)), np.array((1, m)))
+        return cls(np.array((1, c[0])), np.array((1, m[0])))
         
     def unmap(self, t):
         return self.offset + self.unit * self.scale * t
