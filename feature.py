@@ -13,9 +13,9 @@ class Panel():
     Single panel to be developed
     '''
 
-    __slots__ = ('vertices', 'triangles', 'perimeters', 'points', 'quantity', 'mirrors')
+    __slots__ = ('vertices', 'triangles', 'perimeters', 'points', 'quantity', 'mirrors', 'align_axis')
     
-    def __init__(self, vertices, triangles, perimeters, quantity=1, points=None, mirrors=tuple()):
+    def __init__(self, vertices, triangles, perimeters, quantity=1, points=None, mirrors=tuple(), align_axis=tuple()):
         self.vertices = vertices
         self.triangles = triangles
         self.perimeters = perimeters
@@ -23,6 +23,7 @@ class Panel():
         self.points = points
         self.mirrors = [np.ones(3)]
         self.mirrors.extend(mirrors)
+        self.align_axis = align_axis
         
     def flatten(self, tolerance, offset=None, mirror=True):
         triangle_strip = sequence(self.vertices, self.triangles)
@@ -183,8 +184,10 @@ def coaming_ring(plane, bounding_box, samples, split_x, diameter, qty=1, offset=
         internal_perimeter = list(range(len(external_vertices), len(vertices)))
         internal_perimeter.append(len(external_vertices))
         perimeters = [ np.array(external_perimeter), np.array(internal_perimeter) ]
+        
+        align_axis = np.array([index_of(vertices, coaming_inner_peak), index_of(vertices, coaming_outer_peak)], dtype=np.int32)
 
-        return Panel(vertices, np.array(indices, dtype=np.int32), perimeters, qty)
+        return Panel(vertices, np.array(indices, dtype=np.int32), perimeters, qty, align_axis=align_axis)
 
 
 class Part():

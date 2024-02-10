@@ -118,7 +118,9 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + len(self.keel) - 2)))
         perimeter.append(0)
         
-        self.bottom = Panel(vertices, np.array(triangles, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2, mirrors=(self.mirror,))
+        align_axis = np.array([len(self.chine), len(vertices) - 1], dtype=np.int32)
+        
+        self.bottom = Panel(vertices, np.array(triangles, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2, mirrors=(self.mirror,), align_axis=align_axis)
         self.features[Features.BOTTOM] = self.bottom
         
         # Construct hull side
@@ -134,7 +136,9 @@ class Model():
         perimeter.extend(reversed(range(offset, offset + len(self.gunwale))))
         perimeter.append(0)
         
-        self.side = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2, mirrors=(self.mirror,))
+        align_axis = np.array([0, len(self.gunwale) - 1], dtype=np.int32)
+        
+        self.side = Panel(vertices, np.array(indices, dtype=np.int32), [np.array(perimeter, dtype=np.int32)], 2, mirrors=(self.mirror,), align_axis=align_axis)
         self.features[Features.SIDE] = self.side
         
         # Construct coaming base plate
